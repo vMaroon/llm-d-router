@@ -699,7 +699,9 @@ func (s *Scorer) ensureSubscribersForEndpoints(ctx context.Context, endpoints []
 // --- Internal helper methods ---
 
 // computeBlockKeys extracts block keys from an LLM request by tokenizing
-// the prompt and computing KV-block hashes.
+// the prompt and computing KV-block hashes. For multi-prompt completions
+// (Prompt.Strings populated), block keys are computed per prompt and
+// concatenated — each prompt is an independent prefix from EmptyBlockHash.
 func (s *Scorer) computeBlockKeys(ctx context.Context,
 	request *scheduling.LLMRequest) ([]kvblock.BlockHash, error) {
 	if request.Body == nil {
@@ -715,10 +717,46 @@ func (s *Scorer) computeBlockKeys(ctx context.Context,
 
 	// Regular completions path
 	if request.Body.Completions != nil {
-		return s.kvCacheIndexer.ComputeBlockKeys(ctx, nil, request.Body.Completions.Prompt.Raw, request.TargetModel)
+		prompts := completionPrompts(request.Body.Completions.Prompt)
+		if len(prompts) == 0 {
+			return nil, nil
+		}
+		if len(prompts) == 1 {
+			return s.kvCacheIndexer.ComputeBlockKeys(ctx, nil, prompts[0], request.TargetModel)
+		}
+		var all []kvblock.BlockHash
+		for _, p := range prompts {
+			keys, err := s.kvCacheIndexer.ComputeBlockKeys(ctx, nil, p, request.TargetModel)
+			if err != nil {
+				return nil, err
+			}
+			all = append(all, keys...)
+		}
+		return all, nil
 	}
 
 	return nil, nil
+}
+
+// completionPrompts returns the list of prompts to score from a completions
+// request. Single-prompt requests yield one element; OpenAI-style multi-prompt
+// requests (Prompt.Strings) yield N elements. Empty entries are dropped. When
+// both Raw and Strings are populated, Raw takes precedence.
+func completionPrompts(p scheduling.Prompt) []string {
+	if p.Raw != "" {
+		return []string{p.Raw}
+	}
+	if len(p.Strings) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(p.Strings))
+	for _, s := range p.Strings {
+		if s == "" {
+			continue
+		}
+		out = append(out, s)
+	}
+	return out
 }
 
 // extractPodSet builds a set of pod identifiers from endpoints for filtered index lookups.
@@ -790,16 +828,38 @@ func (s *Scorer) getScores(ctx context.Context, cycleState *scheduling.CycleStat
 		return scores, nil
 	}
 
-	// For regular completions, use the prompt directly
+	// For regular completions, use the prompt directly. The prompt may be a
+	// single string (Prompt.Raw) or an OpenAI-style array (Prompt.Strings).
+	// For arrays, score each prompt independently and sum hits per pod —
+	// the chosen pod will receive all prompts in the same request, so total
+	// pre-existing cache coverage is the relevant signal.
 	if request.Body != nil && request.Body.Completions != nil {
-		prompt := request.Body.Completions.Prompt.Raw
-		traceLogger.Info("Using completion prompt directly", "promptLength", len(prompt))
-
-		scores, err := s.kvCacheIndexer.GetPodScores(ctx, nil, prompt, request.TargetModel, nil)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get endpoint scores for completions: %w", err)
+		prompts := completionPrompts(request.Body.Completions.Prompt)
+		if len(prompts) == 0 {
+			return nil, errors.New("no valid input found in request")
 		}
-		return scores, nil
+
+		traceLogger.Info("Scoring completion prompts", "count", len(prompts))
+
+		if len(prompts) == 1 {
+			scores, err := s.kvCacheIndexer.GetPodScores(ctx, nil, prompts[0], request.TargetModel, nil)
+			if err != nil {
+				return nil, fmt.Errorf("failed to get endpoint scores for completions: %w", err)
+			}
+			return scores, nil
+		}
+
+		aggregated := make(map[string]float64)
+		for i, prompt := range prompts {
+			scores, err := s.kvCacheIndexer.GetPodScores(ctx, nil, prompt, request.TargetModel, nil)
+			if err != nil {
+				return nil, fmt.Errorf("failed to get endpoint scores for completions prompt %d: %w", i, err)
+			}
+			for pod, score := range scores {
+				aggregated[pod] += score
+			}
+		}
+		return aggregated, nil
 	}
 
 	return nil, errors.New("no valid input found in request")
