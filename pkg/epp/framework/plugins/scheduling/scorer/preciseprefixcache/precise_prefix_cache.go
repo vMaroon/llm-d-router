@@ -726,7 +726,7 @@ func (s *Scorer) computeBlockKeys(ctx context.Context,
 
 	// Regular completions path
 	if request.Body.Completions != nil {
-		prompts := completionPrompts(request.Body.Completions.Prompt)
+		prompts := tokenizer.CompletionPrompts(request.Body.Completions.Prompt)
 		if len(prompts) == 0 {
 			return nil, nil
 		}
@@ -745,27 +745,6 @@ func (s *Scorer) computeBlockKeys(ctx context.Context,
 	}
 
 	return nil, nil
-}
-
-// completionPrompts returns the list of prompts to score from a completions
-// request. Single-prompt requests yield one element; OpenAI-style multi-prompt
-// requests (Prompt.Strings) yield N elements. Empty entries are dropped. When
-// both Raw and Strings are populated, Raw takes precedence.
-func completionPrompts(p scheduling.Prompt) []string {
-	if p.Raw != "" {
-		return []string{p.Raw}
-	}
-	if len(p.Strings) == 0 {
-		return nil
-	}
-	out := make([]string, 0, len(p.Strings))
-	for _, s := range p.Strings {
-		if s == "" {
-			continue
-		}
-		out = append(out, s)
-	}
-	return out
 }
 
 // extractPodSet builds a set of pod identifiers from endpoints for filtered index lookups.
@@ -808,27 +787,52 @@ func (s *Scorer) getScores(ctx context.Context, cycleState *scheduling.CycleStat
 
 	// Read tokenized prompt from CycleState, written by the tokenizer scorer plugin.
 	if tp, err := scheduling.ReadCycleStateKey[*tokenizer.TokenizedPromptState](
-		cycleState, tokenizer.TokenizedPromptStateKey); err == nil && len(tp.TokenIDs) > 0 {
-		traceLogger.Info("tokens found in CycleState, skipping tokenization")
+		cycleState, tokenizer.TokenizedPromptStateKey); err == nil {
+		seqs := tp.Sequences()
+		if len(seqs) > 0 {
+			traceLogger.Info("tokens found in CycleState, skipping tokenization",
+				"sequenceCount", len(seqs))
 
-		var extraFeatures []*kvblock.BlockExtraFeatures
-		if tp.MMFeatures != nil {
-			extraFeatures = kvblock.ComputeBlockExtraFeatures(
-				tp.MMFeatures.MMHashes, tp.MMFeatures.MMPlaceholders,
-				s.blockSizeTokens, len(tp.TokenIDs))
-		}
+			// Single-sequence path (chat completions / single-prompt completions):
+			// preserve MM features and the original ScoreTokens call.
+			if len(seqs) == 1 {
+				var extraFeatures []*kvblock.BlockExtraFeatures
+				if tp.MMFeatures != nil {
+					extraFeatures = kvblock.ComputeBlockExtraFeatures(
+						tp.MMFeatures.MMHashes, tp.MMFeatures.MMPlaceholders,
+						s.blockSizeTokens, len(seqs[0]))
+				}
+				scores, err := s.kvCacheIndexer.ScoreTokens(ctx, seqs[0], request.TargetModel, nil, extraFeatures)
+				if err != nil {
+					return nil, 0, fmt.Errorf("failed to get endpoint scores for tokens: %w", err)
+				}
+				// Mirrors kvblock token chunking: floor(tokens / blockSize).
+				totalBlocks := 0
+				if s.blockSizeTokens > 0 {
+					totalBlocks = len(seqs[0]) / s.blockSizeTokens
+				}
+				return scores, totalBlocks, nil
+			}
 
-		scores, err := s.kvCacheIndexer.ScoreTokens(ctx, tp.TokenIDs, request.TargetModel, nil, extraFeatures)
-		if err != nil {
-			return nil, 0, fmt.Errorf("failed to get endpoint scores for tokens: %w", err)
+			// Multi-prompt path: score each token sequence independently, sum
+			// hits per pod, and sum totalBlocks across sequences. Multi-prompt
+			// completions are text-only (no MM features).
+			aggregated := make(map[string]float64)
+			totalBlocks := 0
+			for i, seq := range seqs {
+				scores, err := s.kvCacheIndexer.ScoreTokens(ctx, seq, request.TargetModel, nil, nil)
+				if err != nil {
+					return nil, 0, fmt.Errorf("failed to get endpoint scores for tokens (prompt %d): %w", i, err)
+				}
+				for pod, score := range scores {
+					aggregated[pod] += score
+				}
+				if s.blockSizeTokens > 0 {
+					totalBlocks += len(seq) / s.blockSizeTokens
+				}
+			}
+			return aggregated, totalBlocks, nil
 		}
-		// Mirrors kvblock token chunking: floor(tokens / blockSize). Last
-		// partial-block of tokens (if any) does not become its own KV-block.
-		totalBlocks := 0
-		if s.blockSizeTokens > 0 {
-			totalBlocks = len(tp.TokenIDs) / s.blockSizeTokens
-		}
-		return scores, totalBlocks, nil
 	}
 
 	// The upstream parser guarantees exactly one body is populated, but we defensively prioritize chat completions.
@@ -868,7 +872,7 @@ func (s *Scorer) getScores(ctx context.Context, cycleState *scheduling.CycleStat
 	// the same request, so total pre-existing cache coverage is the relevant
 	// signal and the denominator scales with it.
 	if request.Body != nil && request.Body.Completions != nil {
-		prompts := completionPrompts(request.Body.Completions.Prompt)
+		prompts := tokenizer.CompletionPrompts(request.Body.Completions.Prompt)
 		if len(prompts) == 0 {
 			return nil, 0, errors.New("no valid input found in request")
 		}

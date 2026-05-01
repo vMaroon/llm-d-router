@@ -323,3 +323,91 @@ func TestContextLengthAwareFallbackWithoutTokenizedPrompt(t *testing.T) {
 	assert.Equal(t, 1, len(filteredEndpoints))
 	assert.Equal(t, "matching-range", filteredEndpoints[0].GetMetadata().NamespacedName.Name)
 }
+
+// TestContextLengthAware_MultiPromptCycleStateSumsTokens verifies that when
+// the tokenizer plugin has rendered an OpenAI-style array prompt into
+// TokenIDsList, the context-length scorer reads the total across all
+// sequences via TotalTokens(), not just the (empty) TokenIDs field.
+func TestContextLengthAware_MultiPromptCycleStateSumsTokens(t *testing.T) {
+	ctx := utils.NewTestContext(t)
+
+	// Two sequences summing to 30 tokens.
+	seq0 := make([]uint32, 10)
+	seq1 := make([]uint32, 20)
+
+	endpoints := []scheduling.Endpoint{
+		createEndpoint(k8stypes.NamespacedName{Namespace: "default", Name: "fits-30"},
+			"10.0.0.1",
+			map[string]string{DefaultContextLengthLabel: "0-50"}),
+		createEndpoint(k8stypes.NamespacedName{Namespace: "default", Name: "wants-bigger"},
+			"10.0.0.2",
+			map[string]string{DefaultContextLengthLabel: "100-200"}),
+	}
+
+	plugin := NewContextLengthAware("test-multi", &contextLengthAwareParameters{
+		Label:           DefaultContextLengthLabel,
+		EnableFiltering: true,
+	})
+
+	cycleState := scheduling.NewCycleState()
+	cycleState.Write(tokenizer.TokenizedPromptStateKey, &tokenizer.TokenizedPromptState{
+		TokenIDsList: [][]uint32{seq0, seq1},
+	})
+
+	request := &scheduling.LLMRequest{
+		RequestId:   "test-multi-cycle",
+		TargetModel: "test-model",
+		Body: &scheduling.LLMRequestBody{
+			Completions: &scheduling.CompletionsRequest{
+				Prompt: scheduling.Prompt{Strings: []string{"a", "b"}},
+			},
+		},
+	}
+
+	filtered := plugin.Filter(ctx, cycleState, request, endpoints)
+	require.Len(t, filtered, 1, "30 tokens should fit only the 0-50 endpoint")
+	assert.Equal(t, "fits-30", filtered[0].GetMetadata().NamespacedName.Name)
+}
+
+// TestContextLengthAware_MultiPromptCharFallback verifies the char-based
+// fallback (no CycleState tokens) sums character counts across the prompt
+// array before applying the chars-per-token multiplier.
+func TestContextLengthAware_MultiPromptCharFallback(t *testing.T) {
+	ctx := utils.NewTestContext(t)
+
+	// 200 chars total → 50 estimated tokens (charToTokenMultiplier=0.25).
+	prompt0 := make([]byte, 100)
+	prompt1 := make([]byte, 100)
+	for i := range prompt0 {
+		prompt0[i] = 'x'
+		prompt1[i] = 'y'
+	}
+
+	endpoints := []scheduling.Endpoint{
+		createEndpoint(k8stypes.NamespacedName{Namespace: "default", Name: "fits-50"},
+			"10.0.0.1",
+			map[string]string{DefaultContextLengthLabel: "0-100"}),
+		createEndpoint(k8stypes.NamespacedName{Namespace: "default", Name: "needs-bigger"},
+			"10.0.0.2",
+			map[string]string{DefaultContextLengthLabel: "200-400"}),
+	}
+
+	plugin := NewContextLengthAware("test-multi-fallback", &contextLengthAwareParameters{
+		Label:           DefaultContextLengthLabel,
+		EnableFiltering: true,
+	})
+
+	request := &scheduling.LLMRequest{
+		RequestId:   "test-fallback-multi",
+		TargetModel: "test-model",
+		Body: &scheduling.LLMRequestBody{
+			Completions: &scheduling.CompletionsRequest{
+				Prompt: scheduling.Prompt{Strings: []string{string(prompt0), string(prompt1)}},
+			},
+		},
+	}
+
+	filtered := plugin.Filter(ctx, nil, request, endpoints)
+	require.Len(t, filtered, 1, "estimated 50 tokens should fit only the 0-100 endpoint")
+	assert.Equal(t, "fits-50", filtered[0].GetMetadata().NamespacedName.Name)
+}

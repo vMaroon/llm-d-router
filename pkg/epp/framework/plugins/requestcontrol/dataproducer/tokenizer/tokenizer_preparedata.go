@@ -47,13 +47,21 @@ func (p *Plugin) PrepareRequestData(ctx context.Context, request *scheduling.LLM
 		return nil
 	}
 
-	tokenIDs, _ := p.tokenize(ctx, request)
-	if tokenIDs == nil {
+	state := p.tokenize(ctx, request)
+	if state == nil {
+		return nil
+	}
+
+	// Upstream's scheduling.TokenizedPrompt only carries a single token sequence,
+	// so we cannot represent multi-prompt requests here. Leave TokenizedPrompt
+	// nil — downstream consumers fall back to their own tokenization paths,
+	// which the precise scorer extends to handle Prompt.Strings directly.
+	if len(state.TokenIDsList) > 0 {
 		return nil
 	}
 
 	request.TokenizedPrompt = &scheduling.TokenizedPrompt{
-		TokenIDs: tokenIDs,
+		TokenIDs: state.TokenIDs,
 	}
 
 	return nil

@@ -77,6 +77,34 @@ func TestGetUserInputLenInTokens(t *testing.T) {
 			req:      completionsRequest(""),
 			wantZero: true,
 		},
+		{
+			// Multi-prompt: 100 + 100 = 200 chars / 4 chars/token = 50 tokens.
+			name: "multi-prompt completions sum chars across prompts",
+			req: &scheduling.LLMRequest{
+				RequestId: "multi",
+				Body: &scheduling.LLMRequestBody{
+					Completions: &scheduling.CompletionsRequest{
+						Prompt: scheduling.Prompt{Strings: []string{
+							strings.Repeat("a", 100),
+							strings.Repeat("b", 100),
+						}},
+					},
+				},
+			},
+			wantMin: 50,
+		},
+		{
+			name: "multi-prompt completions empty array",
+			req: &scheduling.LLMRequest{
+				RequestId: "multi-empty",
+				Body: &scheduling.LLMRequestBody{
+					Completions: &scheduling.CompletionsRequest{
+						Prompt: scheduling.Prompt{Strings: []string{}},
+					},
+				},
+			},
+			wantZero: true,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

@@ -121,9 +121,46 @@ func NewPlugin(ctx context.Context, config *tokenizerPluginConfig) (*Plugin, err
 // stored in CycleState for consumption by downstream scorers.
 // This follows the standard IGW pattern where scorers share data via CycleState
 // (same as NoHitLRU reading from prefix-cache scorer).
+//
+// Single-prompt requests (Prompt.Raw / chat completions) populate TokenIDs and
+// optionally MMFeatures. Multi-prompt requests (OpenAI-style Prompt.Strings
+// arrays) populate TokenIDsList — one token sequence per prompt, no MM
+// features. Consumers should prefer Sequences()/TotalTokens() over reading
+// the fields directly so they handle both shapes uniformly.
 type TokenizedPromptState struct {
-	TokenIDs   []uint32
-	MMFeatures *tokenization.MultiModalFeatures
+	TokenIDs     []uint32
+	TokenIDsList [][]uint32
+	MMFeatures   *tokenization.MultiModalFeatures
+}
+
+// Sequences returns the prompt token sequences regardless of which field is
+// populated. Returns nil when no tokens are present.
+func (t *TokenizedPromptState) Sequences() [][]uint32 {
+	if t == nil {
+		return nil
+	}
+	if len(t.TokenIDsList) > 0 {
+		return t.TokenIDsList
+	}
+	if len(t.TokenIDs) > 0 {
+		return [][]uint32{t.TokenIDs}
+	}
+	return nil
+}
+
+// TotalTokens returns the total token count across all sequences.
+func (t *TokenizedPromptState) TotalTokens() int {
+	if t == nil {
+		return 0
+	}
+	if len(t.TokenIDsList) > 0 {
+		n := 0
+		for _, seq := range t.TokenIDsList {
+			n += len(seq)
+		}
+		return n
+	}
+	return len(t.TokenIDs)
 }
 
 // Clone implements plugin.StateData.
@@ -131,9 +168,46 @@ func (t *TokenizedPromptState) Clone() plugin.StateData {
 	if t == nil {
 		return nil
 	}
-	ids := make([]uint32, len(t.TokenIDs))
-	copy(ids, t.TokenIDs)
-	return &TokenizedPromptState{TokenIDs: ids, MMFeatures: cloneMMFeatures(t.MMFeatures)}
+	var ids []uint32
+	if t.TokenIDs != nil {
+		ids = make([]uint32, len(t.TokenIDs))
+		copy(ids, t.TokenIDs)
+	}
+	var list [][]uint32
+	if t.TokenIDsList != nil {
+		list = make([][]uint32, len(t.TokenIDsList))
+		for i, seq := range t.TokenIDsList {
+			cp := make([]uint32, len(seq))
+			copy(cp, seq)
+			list[i] = cp
+		}
+	}
+	return &TokenizedPromptState{
+		TokenIDs:     ids,
+		TokenIDsList: list,
+		MMFeatures:   cloneMMFeatures(t.MMFeatures),
+	}
+}
+
+// CompletionPrompts returns the list of prompts to process from a completions
+// request. Single-prompt requests yield one element; OpenAI-style multi-prompt
+// requests (Prompt.Strings) yield N elements. Empty entries are dropped. When
+// both Raw and Strings are populated, Raw takes precedence.
+func CompletionPrompts(p scheduling.Prompt) []string {
+	if p.Raw != "" {
+		return []string{p.Raw}
+	}
+	if len(p.Strings) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(p.Strings))
+	for _, s := range p.Strings {
+		if s == "" {
+			continue
+		}
+		out = append(out, s)
+	}
+	return out
 }
 
 // cloneMMFeatures deep-copies the maps/slices so cloned CycleState entries
@@ -180,45 +254,77 @@ func (p *Plugin) WithName(name string) *Plugin {
 	return p
 }
 
-// tokenize extracts token IDs and optional multimodal features from the request.
-// Returns (nil, nil) on error or unsupported type.
-func (p *Plugin) tokenize(ctx context.Context, request *scheduling.LLMRequest) ([]uint32, *tokenization.MultiModalFeatures) {
+// tokenize renders the request prompts and returns a TokenizedPromptState.
+// Returns nil on error, when the request has no body, or when the request type
+// is unsupported. Multi-prompt completions (Prompt.Strings) are rendered one
+// sequence per prompt and surfaced via TokenIDsList.
+func (p *Plugin) tokenize(ctx context.Context, request *scheduling.LLMRequest) *TokenizedPromptState {
 	logger := log.FromContext(ctx).WithName(p.typedName.String())
 	traceLogger := logger.V(logging.TRACE)
 
 	if request.Body == nil {
 		traceLogger.Info("Request body is nil, skipping tokenization")
-		return nil, nil
+		return nil
 	}
 
 	traceLogger.Info("Request body present",
 		"hasCompletions", request.Body.Completions != nil,
 		"hasChatCompletions", request.Body.ChatCompletions != nil)
 
-	var tokenIDs []uint32
-	var mmFeatures *tokenization.MultiModalFeatures
-	var err error
-
 	switch {
 	case request.Body.Completions != nil:
-		traceLogger.Info("Calling Render for completions", "prompt", request.Body.Completions.Prompt)
-		tokenIDs, _, err = p.tokenizer.Render(request.Body.Completions.Prompt.Raw)
+		prompts := CompletionPrompts(request.Body.Completions.Prompt)
+		if len(prompts) == 0 {
+			traceLogger.Info("Completions request has no usable prompt, skipping tokenization")
+			return nil
+		}
+		if len(prompts) == 1 {
+			traceLogger.Info("Calling Render for completions", "promptLength", len(prompts[0]))
+			tokenIDs, _, err := p.tokenizer.Render(prompts[0])
+			if err != nil {
+				logger.Error(err, "Tokenization failed, skipping")
+				return nil
+			}
+			traceLogger.Info("Tokenization succeeded", "tokenCount", len(tokenIDs))
+			return &TokenizedPromptState{TokenIDs: tokenIDs}
+		}
+		traceLogger.Info("Calling Render per prompt for multi-prompt completions", "promptCount", len(prompts))
+		list := make([][]uint32, 0, len(prompts))
+		for i, pr := range prompts {
+			ids, _, err := p.tokenizer.Render(pr)
+			if err != nil {
+				logger.Error(err, "Tokenization failed for prompt, skipping request", "promptIndex", i)
+				return nil
+			}
+			list = append(list, ids)
+		}
+		traceLogger.Info("Multi-prompt tokenization succeeded",
+			"promptCount", len(list), "totalTokens", totalTokenCount(list))
+		return &TokenizedPromptState{TokenIDsList: list}
+
 	case request.Body.ChatCompletions != nil:
 		renderReq := ChatCompletionsToRenderChatRequest(request.Body.ChatCompletions)
 		traceLogger.Info("Calling RenderChat for chat completions", "messageCount", len(request.Body.ChatCompletions.Messages))
-		tokenIDs, mmFeatures, err = p.tokenizer.RenderChat(renderReq)
+		tokenIDs, mmFeatures, err := p.tokenizer.RenderChat(renderReq)
+		if err != nil {
+			logger.Error(err, "Tokenization failed, skipping")
+			return nil
+		}
+		traceLogger.Info("Tokenization succeeded", "tokenCount", len(tokenIDs))
+		return &TokenizedPromptState{TokenIDs: tokenIDs, MMFeatures: mmFeatures}
+
 	default:
 		traceLogger.Info("Unsupported request type, skipping tokenization")
-		return nil, nil
+		return nil
 	}
+}
 
-	if err != nil {
-		logger.Error(err, "Tokenization failed, skipping")
-		return nil, nil
+func totalTokenCount(seqs [][]uint32) int {
+	n := 0
+	for _, s := range seqs {
+		n += len(s)
 	}
-
-	traceLogger.Info("Tokenization succeeded", "tokenCount", len(tokenIDs))
-	return tokenIDs, mmFeatures
+	return n
 }
 
 // ChatCompletionsToRenderChatRequest converts a ChatCompletionsRequest to a

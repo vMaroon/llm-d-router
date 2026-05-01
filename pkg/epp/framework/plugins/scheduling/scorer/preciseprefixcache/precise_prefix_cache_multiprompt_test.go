@@ -23,45 +23,9 @@ import (
 	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/interface/plugin"
 	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/interface/scheduling"
 
+	"github.com/llm-d/llm-d-inference-scheduler/pkg/epp/framework/plugins/requestcontrol/dataproducer/tokenizer"
 	"github.com/llm-d/llm-d-inference-scheduler/test/utils"
 )
-
-func TestCompletionPrompts(t *testing.T) {
-	tests := []struct {
-		name string
-		in   scheduling.Prompt
-		want []string
-	}{
-		{name: "empty", in: scheduling.Prompt{}, want: nil},
-		{name: "raw only", in: scheduling.Prompt{Raw: "hello"}, want: []string{"hello"}},
-		{
-			name: "raw takes precedence over strings",
-			in:   scheduling.Prompt{Raw: "hello", Strings: []string{"a", "b"}},
-			want: []string{"hello"},
-		},
-		{
-			name: "strings array",
-			in:   scheduling.Prompt{Strings: []string{"a", "b", "c"}},
-			want: []string{"a", "b", "c"},
-		},
-		{
-			name: "strings drop empties",
-			in:   scheduling.Prompt{Strings: []string{"a", "", "c"}},
-			want: []string{"a", "c"},
-		},
-		{
-			name: "strings all empty",
-			in:   scheduling.Prompt{Strings: []string{"", ""}},
-			want: []string{},
-		},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			got := completionPrompts(tc.in)
-			assert.Equal(t, tc.want, got)
-		})
-	}
-}
 
 // fakeBlockKeys returns n synthetic kvblock.BlockHash entries — used to feed
 // the mock indexer's totalBlocks accounting in absolute-normalization tests.
@@ -260,4 +224,80 @@ func TestScorer_ColdClusterReturnsZero(t *testing.T) {
 	for _, score := range got {
 		assert.Equal(t, 0.0, score, "cold cluster must score 0.0, not 1.0 (old min-max bug)")
 	}
+}
+
+// TestScorer_MultiPromptCycleStateFastPath verifies that when the tokenizer
+// plugin has pre-tokenized a multi-prompt request, the precise scorer reads
+// TokenIDsList from CycleState, calls ScoreTokens once per sequence with
+// nil MM features, and aggregates both scores AND totalBlocks across
+// sequences. No tokenization should happen here — this is the fast path.
+func TestScorer_MultiPromptCycleStateFastPath(t *testing.T) {
+	ctx := utils.NewTestContext(t)
+
+	// Block size 4. Two sequences of 8 and 12 tokens → totalBlocks = 2 + 3 = 5.
+	seq0 := []uint32{1, 2, 3, 4, 5, 6, 7, 8}
+	seq1 := []uint32{11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22}
+
+	type call struct {
+		tokens []uint32
+		extra  []*kvblock.BlockExtraFeatures
+	}
+	var calls []call
+	scoreTokens := 0
+	scorer := &Scorer{
+		typedName:       plugin.TypedName{Type: PrecisePrefixCachePluginType, Name: "test"},
+		kvEventsConfig:  &kvevents.Config{},
+		pluginState:     plugin.NewPluginState(ctx),
+		blockSizeTokens: 4,
+		kvCacheIndexer: &mockKVCacheIndexer{
+			scoreTokensFunc: func(_ context.Context, tokens []uint32, _ string, _ []string, extra []*kvblock.BlockExtraFeatures) (map[string]float64, error) {
+				scoreTokens++
+				calls = append(calls, call{tokens: tokens, extra: extra})
+				// pod-a gets +2 hits per prompt, pod-b gets +1 per prompt.
+				return map[string]float64{
+					"10.0.0.1:8080": 2,
+					"10.0.0.2:8080": 1,
+				}, nil
+			},
+			computeBlockKeysFunc: func(_ context.Context, _ *types.RenderChatRequest, _, _ string) ([]kvblock.BlockHash, error) {
+				t.Fatal("ComputeBlockKeys must NOT be called when CycleState fast path is taken")
+				return nil, nil
+			},
+			getPodScoresFunc: func(_ context.Context, _ *types.RenderChatRequest, _, _ string, _ []string) (map[string]float64, error) {
+				t.Fatal("GetPodScores must NOT be called when CycleState fast path is taken")
+				return nil, nil
+			},
+		},
+	}
+
+	cycleState := scheduling.NewCycleState()
+	cycleState.Write(tokenizer.TokenizedPromptStateKey, &tokenizer.TokenizedPromptState{
+		TokenIDsList: [][]uint32{seq0, seq1},
+	})
+
+	request := &scheduling.LLMRequest{
+		RequestId:   "test-multi-cycle",
+		TargetModel: "test-model",
+	}
+
+	got := scorer.Score(ctx, cycleState, request, testEndpoints)
+	require.NotEmpty(t, got)
+
+	// One ScoreTokens call per sequence, in order, with no MM features.
+	require.Equal(t, 2, scoreTokens, "ScoreTokens must be called once per sequence")
+	require.Len(t, calls, 2)
+	assert.Equal(t, seq0, calls[0].tokens)
+	assert.Nil(t, calls[0].extra, "multi-prompt completions are text-only")
+	assert.Equal(t, seq1, calls[1].tokens)
+	assert.Nil(t, calls[1].extra)
+
+	// Aggregated: pod-a=4 hits, pod-b=2 hits, totalBlocks=5.
+	// Absolute: pod-a = 4/5 = 0.8, pod-b = 2/5 = 0.4.
+	gotByAddr := make(map[string]float64)
+	for ep, score := range got {
+		m := ep.GetMetadata()
+		gotByAddr[fmt.Sprintf("%s:%s", m.Address, m.Port)] = score
+	}
+	assert.InDelta(t, 0.8, gotByAddr["10.0.0.1:8080"], 1e-9, "pod-a 4 hits / 5 totalBlocks")
+	assert.InDelta(t, 0.4, gotByAddr["10.0.0.2:8080"], 1e-9, "pod-b 2 hits / 5 totalBlocks")
 }

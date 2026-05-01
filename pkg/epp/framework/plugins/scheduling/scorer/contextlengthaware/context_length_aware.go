@@ -205,10 +205,13 @@ func (p *ContextLengthAware) getContextLength(ctx context.Context, cycleState *s
 	}
 
 	// Read tokenized prompt from CycleState, written by the tokenizer scorer plugin.
+	// TotalTokens sums across all sequences for OpenAI-style multi-prompt requests.
 	if cycleState != nil {
 		if tp, err := scheduling.ReadCycleStateKey[*tokenizer.TokenizedPromptState](
-			cycleState, tokenizer.TokenizedPromptStateKey); err == nil && len(tp.TokenIDs) > 0 {
-			return len(tp.TokenIDs), true
+			cycleState, tokenizer.TokenizedPromptStateKey); err == nil {
+			if total := tp.TotalTokens(); total > 0 {
+				return total, true
+			}
 		}
 	}
 
@@ -235,9 +238,11 @@ func estimateContextLength(request *scheduling.LLMRequest) int {
 		}
 	}
 
-	// Handle regular completions
+	// Handle regular completions (single Prompt.Raw or multi-prompt Prompt.Strings).
 	if request.Body.Completions != nil {
-		totalChars += len(request.Body.Completions.Prompt.Raw)
+		for _, p := range tokenizer.CompletionPrompts(request.Body.Completions.Prompt) {
+			totalChars += len(p)
+		}
 	}
 
 	// Convert characters to approximate token count

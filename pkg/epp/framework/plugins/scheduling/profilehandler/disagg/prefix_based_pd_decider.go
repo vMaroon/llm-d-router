@@ -11,6 +11,8 @@ import (
 	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/interface/plugin"
 	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/interface/scheduling"
 	approxprefix "sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/plugins/datalayer/attribute/prefix"
+
+	"github.com/llm-d/llm-d-inference-scheduler/pkg/epp/framework/plugins/requestcontrol/dataproducer/tokenizer"
 )
 
 const (
@@ -148,12 +150,18 @@ func (d *PrefixBasedPDDecider) disaggregate(ctx context.Context, request *schedu
 }
 
 // getUserInputLenInTokens returns an estimated token count for the user input.
+// For multi-prompt completions (Prompt.Strings), it sums the character count
+// across all prompts before applying the chars-per-token estimate.
 func getUserInputLenInTokens(request *scheduling.LLMRequest) (int, error) {
 	if request == nil || request.Body == nil {
 		return 0, errors.New("request or request body is nil")
 	}
 	if request.Body.Completions != nil {
-		return len(request.Body.Completions.Prompt.Raw) / AverageCharactersPerToken, nil
+		totalChars := 0
+		for _, p := range tokenizer.CompletionPrompts(request.Body.Completions.Prompt) {
+			totalChars += len(p)
+		}
+		return totalChars / AverageCharactersPerToken, nil
 	}
 	if request.Body.ChatCompletions == nil {
 		return 0, errors.New("request has neither completions nor chat completions body")
