@@ -409,10 +409,15 @@ func (s *Scorer) PrepareRequestData(ctx context.Context,
 // --- Scorer implementation ---
 
 // Score scores the provided endpoint based on the KVCache index state.
-// The returned scores are normalized to a range of 0-1.
+// The returned scores are normalized to [0, 1] as `score / totalBlocks` —
+// the absolute fraction of the request's KV-blocks each pod already holds.
+// This mirrors the approximate scorer's `matched_blocks / total_blocks`
+// semantics, so cold clusters (no hits anywhere) emit 0.0 across the board
+// instead of a spurious 1.0 from the previous min-max normalization.
+//
 // If PrepareRequestData was called beforehand, Score reuses the pre-computed
-// results from PluginState. Otherwise, it falls back to computing scores
-// directly via getScores (backward compatible).
+// scores and derives totalBlocks from the cached blockKeys. Otherwise it
+// falls back to getScores, which returns both the scores and totalBlocks.
 func (s *Scorer) Score(ctx context.Context, cycleState *scheduling.CycleState, request *scheduling.LLMRequest, endpoints []scheduling.Endpoint) map[scheduling.Endpoint]float64 {
 	// Start tracing span for scoring operation
 	tracer := telemetry.Tracer()
@@ -453,23 +458,27 @@ func (s *Scorer) Score(ctx context.Context, cycleState *scheduling.CycleState, r
 		span.SetAttributes(attribute.String("gen_ai.request.id", request.RequestId))
 	}
 
-	// Try to reuse pre-computed scores from PrepareRequestData
+	// Try to reuse pre-computed scores from PrepareRequestData. The
+	// pre-computed blockKeys slice IS the request's block list, so its length
+	// is exactly the totalBlocks denominator the absolute normalizer needs.
 	var scores map[string]float64
+	var totalBlocks int
 	if pluginStateData, err := plugin.ReadPluginStateKey[*precisePluginState](
 		s.pluginState, request.RequestId, stateKey); err == nil {
 		scores = pluginStateData.scores
-		debugLogger.Info("Reusing pre-computed scores from PrepareRequestData")
+		totalBlocks = len(pluginStateData.blockKeys)
+		debugLogger.Info("Reusing pre-computed scores from PrepareRequestData", "totalBlocks", totalBlocks)
 	} else {
 		// Fallback: compute scores directly (backward compatible path).
 		var scoreErr error
-		scores, scoreErr = s.getScores(ctx, cycleState, request)
+		scores, totalBlocks, scoreErr = s.getScores(ctx, cycleState, request)
 		if scoreErr != nil {
 			logger.Error(scoreErr, "Failed to get endpoint scores")
 			span.SetStatus(codes.Error, scoreErr.Error())
 			return nil
 		}
 	}
-	debugLogger.Info("Got endpoint scores", "scores", scores)
+	debugLogger.Info("Got endpoint scores", "scores", scores, "totalBlocks", totalBlocks)
 
 	// Track scoring statistics
 	span.SetAttributes(
@@ -498,7 +507,7 @@ func (s *Scorer) Score(ctx context.Context, cycleState *scheduling.CycleState, r
 		endpoint.Put(approxprefix.PrefixCacheMatchInfoKey, approxprefix.NewPrefixCacheMatchInfo(matchBlocks, 1, 1))
 	}
 
-	normalizedScores := indexedScoresToNormalizedScoredPods(endpoints, endpointToKey, scores)
+	normalizedScores := absoluteScoredPods(endpoints, endpointToKey, scores, totalBlocks)
 
 	// Calculate score distribution for observability
 	if len(normalizedScores) > 0 {
@@ -775,12 +784,21 @@ func (s *Scorer) getBlockSizeTokens() int {
 	return s.blockSizeTokens
 }
 
-// getScores retrieves the endpoint scores from the KV-cache indexer
-// based on the provided LLM request.
+// getScores retrieves the endpoint scores from the KV-cache indexer based on
+// the provided LLM request. Returns the per-pod scores along with the total
+// number of KV-blocks the request would occupy — the absolute denominator
+// the caller uses to normalize scores into [0, 1].
+//
 // If tokenized prompt data is found in CycleState (written by the tokenizer
-// scorer plugin), it calls ScoreTokens directly, bypassing prompt/chat tokenization.
-// Otherwise, chat completions and regular completions are tokenized internally.
-func (s *Scorer) getScores(ctx context.Context, cycleState *scheduling.CycleState, request *scheduling.LLMRequest) (map[string]float64, error) {
+// scorer plugin), this calls ScoreTokens directly, bypassing prompt/chat
+// tokenization. Otherwise, chat completions and regular completions are
+// tokenized internally. Multi-prompt completions (Prompt.Strings) are scored
+// per prompt and aggregated; totalBlocks sums across the array.
+//
+// This is the legacy fallback path. Production traffic flows through
+// PrepareRequestData → speculative path, which derives totalBlocks from the
+// pre-computed `blockKeys` slice and never calls getScores.
+func (s *Scorer) getScores(ctx context.Context, cycleState *scheduling.CycleState, request *scheduling.LLMRequest) (map[string]float64, int, error) {
 	logger := log.FromContext(ctx).WithName(s.typedName.String())
 	traceLogger := logger.V(logging.TRACE)
 
@@ -802,9 +820,15 @@ func (s *Scorer) getScores(ctx context.Context, cycleState *scheduling.CycleStat
 
 		scores, err := s.kvCacheIndexer.ScoreTokens(ctx, tp.TokenIDs, request.TargetModel, nil, extraFeatures)
 		if err != nil {
-			return nil, fmt.Errorf("failed to get endpoint scores for tokens: %w", err)
+			return nil, 0, fmt.Errorf("failed to get endpoint scores for tokens: %w", err)
 		}
-		return scores, nil
+		// Mirrors kvblock token chunking: floor(tokens / blockSize). Last
+		// partial-block of tokens (if any) does not become its own KV-block.
+		totalBlocks := 0
+		if s.blockSizeTokens > 0 {
+			totalBlocks = len(tp.TokenIDs) / s.blockSizeTokens
+		}
+		return scores, totalBlocks, nil
 	}
 
 	// The upstream parser guarantees exactly one body is populated, but we defensively prioritize chat completions.
@@ -821,46 +845,66 @@ func (s *Scorer) getScores(ctx context.Context, cycleState *scheduling.CycleStat
 			"toolsCount", len(renderReq.Tools),
 			"documentsCount", len(renderReq.Documents))
 
+		// ComputeBlockKeys gives us the request's total block count for
+		// absolute normalization. Yes, this re-tokenizes (GetPodScores does
+		// the same internally) — acceptable in the legacy fallback since
+		// production uses the speculative path.
+		blockKeys, err := s.kvCacheIndexer.ComputeBlockKeys(ctx, renderReq, "", request.TargetModel)
+		if err != nil {
+			return nil, 0, fmt.Errorf("failed to compute block keys for chat/completions: %w", err)
+		}
+
 		scores, err := s.kvCacheIndexer.GetPodScores(ctx, renderReq, "", request.TargetModel, nil)
 		if err != nil {
-			return nil, fmt.Errorf("failed to get endpoint scores for chat/completions: %w", err)
+			return nil, 0, fmt.Errorf("failed to get endpoint scores for chat/completions: %w", err)
 		}
-		return scores, nil
+		return scores, len(blockKeys), nil
 	}
 
 	// For regular completions, use the prompt directly. The prompt may be a
 	// single string (Prompt.Raw) or an OpenAI-style array (Prompt.Strings).
-	// For arrays, score each prompt independently and sum hits per pod —
-	// the chosen pod will receive all prompts in the same request, so total
-	// pre-existing cache coverage is the relevant signal.
+	// For arrays, score each prompt independently, sum hits per pod, and sum
+	// totalBlocks across prompts — the chosen pod will receive all prompts in
+	// the same request, so total pre-existing cache coverage is the relevant
+	// signal and the denominator scales with it.
 	if request.Body != nil && request.Body.Completions != nil {
 		prompts := completionPrompts(request.Body.Completions.Prompt)
 		if len(prompts) == 0 {
-			return nil, errors.New("no valid input found in request")
+			return nil, 0, errors.New("no valid input found in request")
 		}
 
 		traceLogger.Info("Scoring completion prompts", "count", len(prompts))
 
 		if len(prompts) == 1 {
+			blockKeys, err := s.kvCacheIndexer.ComputeBlockKeys(ctx, nil, prompts[0], request.TargetModel)
+			if err != nil {
+				return nil, 0, fmt.Errorf("failed to compute block keys for completions: %w", err)
+			}
 			scores, err := s.kvCacheIndexer.GetPodScores(ctx, nil, prompts[0], request.TargetModel, nil)
 			if err != nil {
-				return nil, fmt.Errorf("failed to get endpoint scores for completions: %w", err)
+				return nil, 0, fmt.Errorf("failed to get endpoint scores for completions: %w", err)
 			}
-			return scores, nil
+			return scores, len(blockKeys), nil
 		}
 
 		aggregated := make(map[string]float64)
+		totalBlocks := 0
 		for i, prompt := range prompts {
+			blockKeys, err := s.kvCacheIndexer.ComputeBlockKeys(ctx, nil, prompt, request.TargetModel)
+			if err != nil {
+				return nil, 0, fmt.Errorf("failed to compute block keys for completions prompt %d: %w", i, err)
+			}
+			totalBlocks += len(blockKeys)
 			scores, err := s.kvCacheIndexer.GetPodScores(ctx, nil, prompt, request.TargetModel, nil)
 			if err != nil {
-				return nil, fmt.Errorf("failed to get endpoint scores for completions prompt %d: %w", i, err)
+				return nil, 0, fmt.Errorf("failed to get endpoint scores for completions prompt %d: %w", i, err)
 			}
 			for pod, score := range scores {
 				aggregated[pod] += score
 			}
 		}
-		return aggregated, nil
+		return aggregated, totalBlocks, nil
 	}
 
-	return nil, errors.New("no valid input found in request")
+	return nil, 0, errors.New("no valid input found in request")
 }

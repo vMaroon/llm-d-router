@@ -36,8 +36,9 @@ import (
 )
 
 type mockKVCacheIndexer struct {
-	getPodScoresFunc func(ctx context.Context, renderReq *types.RenderChatRequest, prompt, modelName string, podIdentifiers []string) (map[string]float64, error)
-	scoreTokensFunc  func(ctx context.Context, tokens []uint32, modelName string, podIdentifiers []string, extraFeatures []*kvblock.BlockExtraFeatures) (map[string]float64, error)
+	getPodScoresFunc     func(ctx context.Context, renderReq *types.RenderChatRequest, prompt, modelName string, podIdentifiers []string) (map[string]float64, error)
+	scoreTokensFunc      func(ctx context.Context, tokens []uint32, modelName string, podIdentifiers []string, extraFeatures []*kvblock.BlockExtraFeatures) (map[string]float64, error)
+	computeBlockKeysFunc func(ctx context.Context, renderReq *types.RenderChatRequest, prompt, modelName string) ([]kvblock.BlockHash, error)
 }
 
 func (m *mockKVCacheIndexer) GetPodScores(ctx context.Context, renderReq *types.RenderChatRequest, prompt, modelName string, podIdentifiers []string) (map[string]float64, error) {
@@ -55,6 +56,9 @@ func (m *mockKVCacheIndexer) ScoreTokens(ctx context.Context, tokens []uint32, m
 }
 
 func (m *mockKVCacheIndexer) ComputeBlockKeys(ctx context.Context, renderReq *types.RenderChatRequest, prompt, modelName string) ([]kvblock.BlockHash, error) {
+	if m.computeBlockKeysFunc != nil {
+		return m.computeBlockKeysFunc(ctx, renderReq, prompt, modelName)
+	}
 	return nil, nil
 }
 

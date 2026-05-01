@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/llm-d/llm-d-kv-cache/pkg/kvcache/kvblock"
 	"github.com/llm-d/llm-d-kv-cache/pkg/kvevents"
 	"github.com/llm-d/llm-d-kv-cache/pkg/tokenization/types"
 	"github.com/stretchr/testify/assert"
@@ -62,18 +63,28 @@ func TestCompletionPrompts(t *testing.T) {
 	}
 }
 
+// fakeBlockKeys returns n synthetic kvblock.BlockHash entries — used to feed
+// the mock indexer's totalBlocks accounting in absolute-normalization tests.
+// The contents don't matter; only the length is read by getScores.
+func fakeBlockKeys(n int) []kvblock.BlockHash {
+	out := make([]kvblock.BlockHash, n)
+	for i := range out {
+		out[i] = kvblock.BlockHash(uint64(i + 1))
+	}
+	return out
+}
+
 // TestScorer_MultiPromptAggregatesHits verifies that when a Completions
 // request carries an OpenAI-style array of prompts, the precise scorer issues
-// one tokenization/scoring call per prompt and sums the per-pod hits before
-// normalization.
+// one tokenization/scoring call per prompt, sums the per-pod hits AND the
+// per-prompt block totals, and emits absolute coverage scores in [0, 1].
 func TestScorer_MultiPromptAggregatesHits(t *testing.T) {
 	ctx := utils.NewTestContext(t)
 
-	// Per-prompt scores: pod-a wins prompt-0 by 5, pod-b wins prompt-1 by 4.
-	// Aggregated: pod-a=5+1=6, pod-b=2+4=6. They tie, so under min-max
-	// normalization (min==max branch) both endpoints score 1.0 — confirming
-	// the sum lands the same value on both pods.
-	perPrompt := map[string]map[string]float64{
+	// Per-prompt scores: pod-a=5+1=6, pod-b=2+4=6 (tie).
+	// Per-prompt totalBlocks: 10 each → totalBlocks = 20.
+	// Expected absolute: pod-a = 6/20 = 0.3, pod-b = 6/20 = 0.3.
+	perPromptScores := map[string]map[string]float64{
 		"prompt-zero": {"10.0.0.1:8080": 5, "10.0.0.2:8080": 2},
 		"prompt-one":  {"10.0.0.1:8080": 1, "10.0.0.2:8080": 4},
 	}
@@ -86,10 +97,13 @@ func TestScorer_MultiPromptAggregatesHits(t *testing.T) {
 		kvCacheIndexer: &mockKVCacheIndexer{
 			getPodScoresFunc: func(_ context.Context, _ *types.RenderChatRequest, prompt, _ string, _ []string) (map[string]float64, error) {
 				seenPrompts = append(seenPrompts, prompt)
-				if s, ok := perPrompt[prompt]; ok {
+				if s, ok := perPromptScores[prompt]; ok {
 					return s, nil
 				}
 				return nil, fmt.Errorf("unexpected prompt: %s", prompt)
+			},
+			computeBlockKeysFunc: func(_ context.Context, _ *types.RenderChatRequest, _, _ string) ([]kvblock.BlockHash, error) {
+				return fakeBlockKeys(10), nil
 			},
 		},
 	}
@@ -114,18 +128,20 @@ func TestScorer_MultiPromptAggregatesHits(t *testing.T) {
 		m := ep.GetMetadata()
 		gotByAddr[fmt.Sprintf("%s:%s", m.Address, m.Port)] = score
 	}
-	assert.Equal(t, 1.0, gotByAddr["10.0.0.1:8080"])
-	assert.Equal(t, 1.0, gotByAddr["10.0.0.2:8080"])
+	assert.InDelta(t, 0.3, gotByAddr["10.0.0.1:8080"], 1e-9)
+	assert.InDelta(t, 0.3, gotByAddr["10.0.0.2:8080"], 1e-9)
 }
 
-// TestScorer_MultiPromptPicksHighestSum verifies that when one pod has more
-// total hits across the prompt array than the other, the aggregated score
-// pushes that pod to 1.0 and the loser to 0.0 after normalization.
+// TestScorer_MultiPromptPicksHighestSum verifies absolute-normalized scores
+// preserve the relative ordering of cumulative hit counts and that the
+// loser is not stretched up to 1.0 (the old min-max behavior).
 func TestScorer_MultiPromptPicksHighestSum(t *testing.T) {
 	ctx := utils.NewTestContext(t)
 
-	// pod-a: 5+5=10, pod-b: 1+2=3. pod-a should win.
-	perPrompt := map[string]map[string]float64{
+	// pod-a: 5+5=10 hits, pod-b: 1+2=3 hits.
+	// totalBlocks per prompt = 10 → totalBlocks = 20.
+	// Absolute: pod-a = 10/20 = 0.5, pod-b = 3/20 = 0.15.
+	perPromptScores := map[string]map[string]float64{
 		"p0": {"10.0.0.1:8080": 5, "10.0.0.2:8080": 1},
 		"p1": {"10.0.0.1:8080": 5, "10.0.0.2:8080": 2},
 	}
@@ -136,7 +152,10 @@ func TestScorer_MultiPromptPicksHighestSum(t *testing.T) {
 		pluginState:    plugin.NewPluginState(ctx),
 		kvCacheIndexer: &mockKVCacheIndexer{
 			getPodScoresFunc: func(_ context.Context, _ *types.RenderChatRequest, prompt, _ string, _ []string) (map[string]float64, error) {
-				return perPrompt[prompt], nil
+				return perPromptScores[prompt], nil
+			},
+			computeBlockKeysFunc: func(_ context.Context, _ *types.RenderChatRequest, _, _ string) ([]kvblock.BlockHash, error) {
+				return fakeBlockKeys(10), nil
 			},
 		},
 	}
@@ -159,24 +178,30 @@ func TestScorer_MultiPromptPicksHighestSum(t *testing.T) {
 		m := ep.GetMetadata()
 		gotByAddr[fmt.Sprintf("%s:%s", m.Address, m.Port)] = score
 	}
-	assert.Equal(t, 1.0, gotByAddr["10.0.0.1:8080"], "pod-a has the higher cumulative hit count")
-	assert.Equal(t, 0.0, gotByAddr["10.0.0.2:8080"])
+	assert.InDelta(t, 0.5, gotByAddr["10.0.0.1:8080"], 1e-9, "pod-a 10 hits / 20 blocks")
+	assert.InDelta(t, 0.15, gotByAddr["10.0.0.2:8080"], 1e-9, "pod-b 3 hits / 20 blocks (no longer stretched to 0.0)")
 }
 
-// TestScorer_SinglePromptStillUsesRawPath verifies the single-string path
-// remains a single GetPodScores call (no aggregation overhead).
-func TestScorer_SinglePromptStillUsesRawPath(t *testing.T) {
+// TestScorer_SinglePromptAbsoluteNormalization confirms the single-prompt
+// path also uses absolute coverage and only issues one GetPodScores call.
+func TestScorer_SinglePromptAbsoluteNormalization(t *testing.T) {
 	ctx := utils.NewTestContext(t)
-	calls := 0
+	scoreCalls := 0
+	blockCalls := 0
 	scorer := &Scorer{
 		typedName:      plugin.TypedName{Type: PrecisePrefixCachePluginType, Name: "test"},
 		kvEventsConfig: &kvevents.Config{},
 		pluginState:    plugin.NewPluginState(ctx),
 		kvCacheIndexer: &mockKVCacheIndexer{
 			getPodScoresFunc: func(_ context.Context, _ *types.RenderChatRequest, prompt, _ string, _ []string) (map[string]float64, error) {
-				calls++
+				scoreCalls++
 				assert.Equal(t, "hello", prompt)
-				return map[string]float64{"10.0.0.1:8080": 1.0}, nil
+				return map[string]float64{"10.0.0.1:8080": 4}, nil
+			},
+			computeBlockKeysFunc: func(_ context.Context, _ *types.RenderChatRequest, prompt, _ string) ([]kvblock.BlockHash, error) {
+				blockCalls++
+				assert.Equal(t, "hello", prompt)
+				return fakeBlockKeys(8), nil
 			},
 		},
 	}
@@ -189,6 +214,50 @@ func TestScorer_SinglePromptStillUsesRawPath(t *testing.T) {
 		},
 	}
 
-	scorer.Score(ctx, scheduling.NewCycleState(), request, testEndpoints)
-	assert.Equal(t, 1, calls, "single-prompt requests must issue exactly one tokenization call")
+	got := scorer.Score(ctx, scheduling.NewCycleState(), request, testEndpoints)
+	assert.Equal(t, 1, scoreCalls, "single-prompt requests must issue exactly one GetPodScores call")
+	assert.Equal(t, 1, blockCalls, "single-prompt requests must issue exactly one ComputeBlockKeys call")
+
+	gotByAddr := make(map[string]float64)
+	for ep, score := range got {
+		m := ep.GetMetadata()
+		gotByAddr[fmt.Sprintf("%s:%s", m.Address, m.Port)] = score
+	}
+	// pod-a: 4 hits / 8 blocks = 0.5. The other endpoint in testEndpoints
+	// has no hits → 0.0 (cold pod no longer gets stretched to 0/0).
+	assert.InDelta(t, 0.5, gotByAddr["10.0.0.1:8080"], 1e-9)
+}
+
+// TestScorer_ColdClusterReturnsZero is the regression guard: with no hits
+// reported for any pod, absolute normalization must yield 0.0 across the
+// board, not the 1.0 uniform that the old min-max code produced.
+func TestScorer_ColdClusterReturnsZero(t *testing.T) {
+	ctx := utils.NewTestContext(t)
+	scorer := &Scorer{
+		typedName:      plugin.TypedName{Type: PrecisePrefixCachePluginType, Name: "test"},
+		kvEventsConfig: &kvevents.Config{},
+		pluginState:    plugin.NewPluginState(ctx),
+		kvCacheIndexer: &mockKVCacheIndexer{
+			getPodScoresFunc: func(_ context.Context, _ *types.RenderChatRequest, _, _ string, _ []string) (map[string]float64, error) {
+				return map[string]float64{}, nil
+			},
+			computeBlockKeysFunc: func(_ context.Context, _ *types.RenderChatRequest, _, _ string) ([]kvblock.BlockHash, error) {
+				return fakeBlockKeys(8), nil
+			},
+		},
+	}
+
+	request := &scheduling.LLMRequest{
+		RequestId:   "test-cold",
+		TargetModel: "test-model",
+		Body: &scheduling.LLMRequestBody{
+			Completions: &scheduling.CompletionsRequest{Prompt: scheduling.Prompt{Raw: "hello"}},
+		},
+	}
+
+	got := scorer.Score(ctx, scheduling.NewCycleState(), request, testEndpoints)
+	require.NotEmpty(t, got)
+	for _, score := range got {
+		assert.Equal(t, 0.0, score, "cold cluster must score 0.0, not 1.0 (old min-max bug)")
+	}
 }
