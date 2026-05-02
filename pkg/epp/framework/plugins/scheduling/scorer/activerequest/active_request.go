@@ -26,6 +26,30 @@ const (
 	// defaultRequestTimeout defines the default timeout for open requests to be
 	// considered stale and removed from the cache.
 	defaultRequestTimeout = 2 * time.Minute
+
+	// LoadUnitRequests counts each request as 1 unit (with multi-prompt
+	// completions counted as N — len(Prompt.Strings)). This is the default
+	// and the original behavior of the scorer.
+	LoadUnitRequests = "requests"
+
+	// LoadUnitTokens counts each request by its prompt token total. When the
+	// tokenizer plugin has populated CycleState the exact count is used; in
+	// its absence the scorer falls back to ceil(prompt_chars / 4). Useful
+	// when request size variance is large enough that a request count is a
+	// poor proxy for engine load.
+	LoadUnitTokens = "tokens"
+
+	// inflightTokensTTL bounds how long a token count stashed by Score can
+	// linger before being garbage-collected. PreRequest typically consumes
+	// the stash within microseconds; this is just a safety net for the case
+	// where the picker returns no endpoint and PreRequest never fires.
+	inflightTokensTTL = 30 * time.Second
+
+	// charsPerTokenEstimate is the rough chars-per-token ratio used by the
+	// LoadUnitTokens fallback when CycleState tokens are unavailable.
+	// Mirrors disagg's AverageCharactersPerToken — pick the same constant
+	// to keep estimates consistent across plugins.
+	charsPerTokenEstimate = 4
 )
 
 // Parameters defines the parameters for the
@@ -41,6 +65,10 @@ type Parameters struct {
 	// to be considered "idle". Pods with request count <= idleThreshold
 	// will receive a score of 1.0.
 	// Default: 0 (only pods with zero requests are considered idle)
+	//
+	// When LoadUnit is "tokens", the threshold is interpreted in tokens as
+	// well — a pod with <= IdleThreshold tokens in flight is considered idle.
+	// Tune accordingly (e.g. 1024 tokens vs 0 requests).
 	IdleThreshold int `json:"idleThreshold"`
 
 	// MaxBusyScore defines the maximum score that can be assigned to busy pods
@@ -50,6 +78,17 @@ type Parameters struct {
 	// Default: 1.0 (no gap, current behavior)
 	// Example: 0.5 means idle pods get 1.0, busiest pod gets 0.0, least busy gets 0.5
 	MaxBusyScore float64 `json:"maxBusyScore"`
+
+	// LoadUnit selects what each in-flight request contributes to a pod's
+	// load count.
+	//   "requests" (default): each request is 1 unit; multi-prompt completions
+	//     count as len(Prompt.Strings).
+	//   "tokens": each request contributes its prompt token total. When the
+	//     tokenizer plugin pre-tokenizes (TokenizedPromptState in CycleState),
+	//     the exact total is used; otherwise the scorer falls back to
+	//     ceil(prompt_chars / 4).
+	// Switching this knob changes the unit of IdleThreshold too — re-tune.
+	LoadUnit string `json:"loadUnit,omitempty"`
 }
 
 // requestEntry represents a single request in the cache. Count is the number
@@ -84,6 +123,59 @@ func promptCount(request *scheduling.LLMRequest) int {
 		return 1
 	}
 	return len(prompts)
+}
+
+// loadDelta returns the per-pod load delta this request contributes,
+// in the unit configured by LoadUnit.
+//
+//   - "requests": delegates to promptCount.
+//   - "tokens": consumes the per-request token total stashed by Score
+//     (from TokenizedPromptState in CycleState). Falls back to a char-based
+//     estimate (chars/4) when no exact count is available so requests that
+//     bypass the tokenizer plugin still contribute a meaningful load.
+func (s *ActiveRequest) loadDelta(request *scheduling.LLMRequest) int {
+	if s.loadUnit != LoadUnitTokens {
+		return promptCount(request)
+	}
+	if request != nil && request.RequestId != "" {
+		if item, found := s.inflightTokens.GetAndDelete(request.RequestId); found {
+			if n := item.Value(); n > 0 {
+				return n
+			}
+		}
+	}
+	return estimateTokens(request)
+}
+
+// estimateTokens returns a chars-per-token estimate for the request body.
+// Used by the LoadUnitTokens fallback when the tokenizer plugin hasn't
+// pre-tokenized (e.g. tokenizer unconfigured, render failed, request bypassed
+// the scoring phase). Returns 1 for nil/empty bodies so the request still
+// contributes some load.
+func estimateTokens(request *scheduling.LLMRequest) int {
+	if request == nil || request.Body == nil {
+		return 1
+	}
+	totalChars := 0
+	switch {
+	case request.Body.ChatCompletions != nil:
+		for _, msg := range request.Body.ChatCompletions.Messages {
+			totalChars += len(msg.Content.Raw)
+			for _, block := range msg.Content.Structured {
+				totalChars += len(block.Text)
+			}
+		}
+	case request.Body.Completions != nil:
+		for _, p := range tokenizer.CompletionPrompts(request.Body.Completions.Prompt) {
+			totalChars += len(p)
+		}
+	}
+	if totalChars == 0 {
+		return 1
+	}
+	// ceil(totalChars / charsPerTokenEstimate) to avoid undercounting
+	// short prompts to 0.
+	return (totalChars + charsPerTokenEstimate - 1) / charsPerTokenEstimate
 }
 
 // endpointScores implements logr.Marshaler to lazily convert endpoint keys
@@ -148,11 +240,28 @@ func NewActiveRequest(ctx context.Context, params *Parameters) *ActiveRequest {
 		maxBusyScore = params.MaxBusyScore
 	}
 
-	if idleThreshold != 0 || maxBusyScore != 1.0 {
-		logger.Info("Active request scorer configured with idle preference",
-			"idleThreshold", idleThreshold,
-			"maxBusyScore", maxBusyScore)
+	// Load unit (default: requests). Anything other than "tokens" falls back
+	// to "requests" so misconfigurations don't silently flip semantics.
+	loadUnit := LoadUnitRequests
+	if params != nil && params.LoadUnit == LoadUnitTokens {
+		loadUnit = LoadUnitTokens
 	}
+
+	if idleThreshold != 0 || maxBusyScore != 1.0 || loadUnit != LoadUnitRequests {
+		logger.Info("Active request scorer configured",
+			"idleThreshold", idleThreshold,
+			"maxBusyScore", maxBusyScore,
+			"loadUnit", loadUnit)
+	}
+
+	// inflightTokens stashes the per-request token count observed during
+	// Score (when CycleState carries TokenizedPromptState) so PreRequest can
+	// consume it without re-tokenizing. Short TTL bounds the leak when
+	// PreRequest never fires (rare — picker returned no endpoint).
+	inflightTokens := ttlcache.New[string, int](
+		ttlcache.WithTTL[string, int](inflightTokensTTL),
+		ttlcache.WithDisableTouchOnHit[string, int](),
+	)
 
 	scorer := &ActiveRequest{
 		typedName:      plugin.TypedName{Type: ActiveRequestType},
@@ -161,6 +270,8 @@ func NewActiveRequest(ctx context.Context, params *Parameters) *ActiveRequest {
 		mutex:          &sync.RWMutex{},
 		idleThreshold:  idleThreshold,
 		maxBusyScore:   maxBusyScore,
+		loadUnit:       loadUnit,
+		inflightTokens: inflightTokens,
 	}
 	// callback to decrement count when requests expire
 	// most requests will be removed in ResponseComplete, but this ensures
@@ -180,6 +291,7 @@ func NewActiveRequest(ctx context.Context, params *Parameters) *ActiveRequest {
 	})
 
 	go cleanCachePeriodically(ctx, requestCache, requestTimeout)
+	go cleanCachePeriodically(ctx, inflightTokens, inflightTokensTTL)
 
 	return scorer
 }
@@ -192,7 +304,9 @@ type ActiveRequest struct {
 	// requestCache stores individual request entries with unique composite keys (endpointName.requestID)
 	requestCache *ttlcache.Cache[string, *requestEntry]
 
-	// endpointCounts maintains fast lookup for request counts per endpoint
+	// endpointCounts maintains fast lookup for request counts per endpoint.
+	// Unit is determined by loadUnit (requests by default, tokens when
+	// configured). All values in this map share the same unit — never mix.
 	endpointCounts map[string]int
 	mutex          *sync.RWMutex
 
@@ -200,6 +314,15 @@ type ActiveRequest struct {
 	idleThreshold int
 	// maxBusyScore defines the maximum score for busy (non-idle) pods
 	maxBusyScore float64
+
+	// loadUnit selects requests-vs-tokens accounting (see LoadUnit constants).
+	loadUnit string
+	// inflightTokens caches per-request token counts captured during Score
+	// for consumption by PreRequest, since PreRequest cannot read CycleState
+	// in the default build (the tokenizer plugin runs as a Scorer, not a
+	// PrepareDataPlugin, so its CycleState write isn't visible to other
+	// plugins' PreRequest hooks).
+	inflightTokens *ttlcache.Cache[string, int]
 }
 
 // TypedName returns the typed name of the plugin.
@@ -218,10 +341,22 @@ func (s *ActiveRequest) Category() scheduling.ScorerCategory {
 	return scheduling.Distribution
 }
 
-// Score scores the given endpoints based on the number of active requests
-// being served by each endpoint. The score is normalized to a range of 0-1.
-func (s *ActiveRequest) Score(ctx context.Context, _ *scheduling.CycleState, _ *scheduling.LLMRequest,
+// Score scores the given endpoints based on the in-flight load on each
+// endpoint. The score is normalized to a range of 0-1. Side-effect: when
+// LoadUnit is "tokens", reads TokenizedPromptState from CycleState (written
+// by the tokenizer scorer plugin earlier in the cycle) and stashes the
+// per-request token total for PreRequest to consume.
+func (s *ActiveRequest) Score(ctx context.Context, cycleState *scheduling.CycleState, request *scheduling.LLMRequest,
 	endpoints []scheduling.Endpoint) map[scheduling.Endpoint]float64 {
+	if s.loadUnit == LoadUnitTokens && cycleState != nil && request != nil && request.RequestId != "" {
+		if tp, err := scheduling.ReadCycleStateKey[*tokenizer.TokenizedPromptState](
+			cycleState, tokenizer.TokenizedPromptStateKey); err == nil {
+			if total := tp.TotalTokens(); total > 0 {
+				s.inflightTokens.Set(request.RequestId, total, ttlcache.DefaultTTL)
+			}
+		}
+	}
+
 	scoredEndpoints := make(map[string]int)
 	maxCount := 0
 	s.mutex.RLock()
@@ -271,7 +406,7 @@ func (s *ActiveRequest) PreRequest(
 ) {
 	traceLogger := log.FromContext(ctx).V(logutil.TRACE)
 
-	count := promptCount(request)
+	count := s.loadDelta(request)
 
 	endpointNames := make([]string, 0, len(schedulingResult.ProfileResults))
 	for profileName, profileResult := range schedulingResult.ProfileResults {
