@@ -15,6 +15,8 @@ import (
 	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/interface/plugin"
 	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/interface/requestcontrol"
 	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/interface/scheduling"
+
+	"github.com/llm-d/llm-d-inference-scheduler/pkg/epp/framework/plugins/requestcontrol/dataproducer/tokenizer"
 )
 
 const (
@@ -50,15 +52,38 @@ type Parameters struct {
 	MaxBusyScore float64 `json:"maxBusyScore"`
 }
 
-// requestEntry represents a single request in the cache
+// requestEntry represents a single request in the cache. Count is the number
+// of in-flight units this request contributes to each PodName — 1 for normal
+// requests, len(Prompt.Strings) for OpenAI-style multi-prompt completions.
+// Stored alongside PodNames so increment and decrement always agree even if
+// config changes mid-request.
 type requestEntry struct {
 	PodNames  []string
 	RequestID string
+	Count     int
 }
 
 // String returns a string representation of the request entry.
 func (r requestEntry) String() string {
-	return fmt.Sprintf("%s:%s", r.RequestID, strings.Join(r.PodNames, "."))
+	return fmt.Sprintf("%s:%d:%s", r.RequestID, r.Count, strings.Join(r.PodNames, "."))
+}
+
+// promptCount returns how many in-flight units a request contributes per
+// endpoint. Multi-prompt completions (Prompt.Strings) count as N — the
+// chosen pod processes each prompt independently. Single-prompt completions,
+// chat completions, and unsupported request shapes count as 1.
+func promptCount(request *scheduling.LLMRequest) int {
+	if request == nil || request.Body == nil {
+		return 1
+	}
+	if request.Body.Completions == nil {
+		return 1
+	}
+	prompts := tokenizer.CompletionPrompts(request.Body.Completions.Prompt)
+	if len(prompts) <= 1 {
+		return 1
+	}
+	return len(prompts)
 }
 
 // endpointScores implements logr.Marshaler to lazily convert endpoint keys
@@ -143,8 +168,13 @@ func NewActiveRequest(ctx context.Context, params *Parameters) *ActiveRequest {
 	requestCache.OnEviction(func(_ context.Context, reason ttlcache.EvictionReason,
 		item *ttlcache.Item[string, *requestEntry]) {
 		if reason == ttlcache.EvictionReasonExpired {
-			for _, endpointName := range item.Value().PodNames {
-				scorer.decrementPodCount(endpointName)
+			entry := item.Value()
+			delta := entry.Count
+			if delta <= 0 {
+				delta = 1
+			}
+			for _, endpointName := range entry.PodNames {
+				scorer.decrementPodCount(endpointName, delta)
 			}
 		}
 	})
@@ -231,13 +261,17 @@ func (s *ActiveRequest) Score(ctx context.Context, _ *scheduling.CycleState, _ *
 
 // PreRequest is called before a request is sent to the target endpoint.
 // It creates a new request entry in the cache with its own TTL and
-// increments the endpoint count for fast lookup.
+// increments each target endpoint's count by promptCount(request) so an
+// OpenAI-style multi-prompt completion (Prompt.Strings) loads the chosen
+// pod by N units instead of 1.
 func (s *ActiveRequest) PreRequest(
 	ctx context.Context,
 	request *scheduling.LLMRequest,
 	schedulingResult *scheduling.SchedulingResult,
 ) {
 	traceLogger := log.FromContext(ctx).V(logutil.TRACE)
+
+	count := promptCount(request)
 
 	endpointNames := make([]string, 0, len(schedulingResult.ProfileResults))
 	for profileName, profileResult := range schedulingResult.ProfileResults {
@@ -247,17 +281,18 @@ func (s *ActiveRequest) PreRequest(
 
 		endpointName := profileResult.TargetEndpoints[0].GetMetadata().NamespacedName.String()
 		endpointNames = append(endpointNames, endpointName)
-		s.incrementPodCount(endpointName)
+		s.incrementPodCount(endpointName, count)
 		traceLogger.Info(
 			"Added request to cache",
 			"requestId", request.RequestId,
 			"endpointName", endpointName,
 			"profileName", profileName,
+			"count", count,
 		)
 	}
 
 	// add to request cache
-	s.requestCache.Set(request.RequestId, &requestEntry{PodNames: endpointNames, RequestID: request.RequestId}, 0) // Use default TTL
+	s.requestCache.Set(request.RequestId, &requestEntry{PodNames: endpointNames, RequestID: request.RequestId, Count: count}, 0) // Use default TTL
 }
 
 // ResponseBody is called after a response is sent to the client.
@@ -282,8 +317,12 @@ func (s *ActiveRequest) ResponseBody(
 	if item, found := s.requestCache.GetAndDelete(request.RequestId); found {
 		entry := item.Value()
 		if entry != nil {
+			delta := entry.Count
+			if delta <= 0 {
+				delta = 1
+			}
 			for _, endpointName := range entry.PodNames {
-				s.decrementPodCount(endpointName)
+				s.decrementPodCount(endpointName, delta)
 			}
 			traceLogger.Info("Removed request from cache", "requestEntry", entry.String())
 		} else {
@@ -294,25 +333,36 @@ func (s *ActiveRequest) ResponseBody(
 	}
 }
 
-// incrementPodCount increments the request count for a endpoint.
-func (s *ActiveRequest) incrementPodCount(endpointName string) {
+// incrementPodCount adds delta to the in-flight request count for a endpoint.
+// Multi-prompt requests pass delta = len(Prompt.Strings); single-prompt /
+// chat / unsupported pass delta = 1. Non-positive deltas are clamped to 1
+// so a misconfigured caller can't silently no-op the increment.
+func (s *ActiveRequest) incrementPodCount(endpointName string, delta int) {
+	if delta <= 0 {
+		delta = 1
+	}
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 
-	s.endpointCounts[endpointName]++
+	s.endpointCounts[endpointName] += delta
 }
 
-// decrementPodCount decrements the request count for a endpoint and removes
-// the entry if count reaches zero.
-func (s *ActiveRequest) decrementPodCount(endpointName string) {
+// decrementPodCount subtracts delta from the in-flight count for a endpoint
+// and removes the entry if the count reaches zero. The delta MUST match the
+// value passed to the corresponding incrementPodCount; storing it on
+// requestEntry guarantees that.
+func (s *ActiveRequest) decrementPodCount(endpointName string, delta int) {
+	if delta <= 0 {
+		delta = 1
+	}
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 
 	if count, exists := s.endpointCounts[endpointName]; exists {
-		if count <= 1 {
+		if count <= delta {
 			delete(s.endpointCounts, endpointName)
 		} else {
-			s.endpointCounts[endpointName] = count - 1
+			s.endpointCounts[endpointName] = count - delta
 		}
 	}
 }
