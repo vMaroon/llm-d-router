@@ -25,6 +25,7 @@ import (
 	"github.com/llm-d/llm-d-inference-scheduler/pkg/epp/framework/interface/plugin"
 	fwkrh "github.com/llm-d/llm-d-inference-scheduler/pkg/epp/framework/interface/requesthandling"
 	"github.com/llm-d/llm-d-inference-scheduler/pkg/epp/framework/interface/scheduling"
+	approxprefix "github.com/llm-d/llm-d-inference-scheduler/pkg/epp/framework/plugins/datalayer/attribute/prefix"
 	"github.com/llm-d/llm-d-inference-scheduler/test/utils"
 )
 
@@ -754,6 +755,28 @@ func TestScoreReusesPluginState(t *testing.T) {
 	// pod-a has 2 chunks, pod-b has 1
 	assert.Equal(t, 1.0, gotByAddress["10.0.0.1:8080"])
 	assert.Equal(t, 0.0, gotByAddress["10.0.0.2:8080"])
+
+	// Score() must propagate the real per-endpoint matched-block count and
+	// block-size-tokens so downstream consumers (e.g. the prefix-based PD
+	// decider, upstream prefix scorer) can compute matched-token counts and
+	// hit ratios. A regression where Score() wrote a binary 0/1 with
+	// blockSize=1, totalBlocks=1 would break PD disaggregation thresholds.
+	blockSizeTokens := scorer.getBlockSizeTokens()
+	wantMatchBlocks := map[string]int{
+		"10.0.0.1:8080": 2,
+		"10.0.0.2:8080": 1,
+	}
+	for ep := range scores {
+		m := ep.GetMetadata()
+		addr := fmt.Sprintf("%s:%s", m.Address, m.Port)
+		raw, ok := ep.Get(approxprefix.PrefixCacheMatchInfoKey)
+		require.Truef(t, ok, "endpoint %s missing PrefixCacheMatchInfoKey", addr)
+		info, ok := raw.(*approxprefix.PrefixCacheMatchInfo)
+		require.Truef(t, ok, "endpoint %s has wrong PrefixCacheMatchInfo type", addr)
+		assert.Equalf(t, wantMatchBlocks[addr], info.MatchBlocks(), "endpoint %s matchBlocks", addr)
+		assert.Equalf(t, blockSizeTokens, info.BlockSizeTokens(), "endpoint %s blockSizeTokens", addr)
+		assert.GreaterOrEqualf(t, info.TotalBlocks(), info.MatchBlocks(), "endpoint %s totalBlocks must be >= matchBlocks", addr)
+	}
 }
 
 // TestPreRequest_AddsSpeculativeEntries verifies that PreRequest adds speculative

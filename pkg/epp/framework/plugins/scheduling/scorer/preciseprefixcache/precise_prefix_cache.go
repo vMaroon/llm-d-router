@@ -455,9 +455,11 @@ func (s *Scorer) Score(ctx context.Context, cycleState *scheduling.CycleState, r
 
 	// Try to reuse pre-computed scores from PrepareRequestData
 	var scores map[string]float64
+	totalBlocks := 0
 	if pluginStateData, err := plugin.ReadPluginStateKey[*precisePluginState](
 		s.pluginState, request.RequestID, stateKey); err == nil {
 		scores = pluginStateData.scores
+		totalBlocks = len(pluginStateData.blockKeys)
 		debugLogger.Info("Reusing pre-computed scores from PrepareRequestData")
 	} else {
 		// Fallback: compute scores directly (backward compatible path).
@@ -467,6 +469,12 @@ func (s *Scorer) Score(ctx context.Context, cycleState *scheduling.CycleState, r
 			logger.Error(scoreErr, "Failed to get endpoint scores")
 			span.SetStatus(codes.Error, scoreErr.Error())
 			return nil
+		}
+		// Compute block keys so totalBlocks reflects the request's true block count.
+		// Without this, downstream consumers (e.g. prefix-based PD decider) get a
+		// dummy total and lose the ability to compute cached-token amounts.
+		if blockKeys, err := s.computeBlockKeys(ctx, request); err == nil {
+			totalBlocks = len(blockKeys)
 		}
 	}
 	debugLogger.Info("Got endpoint scores", "scores", scores)
@@ -486,16 +494,20 @@ func (s *Scorer) Score(ctx context.Context, cycleState *scheduling.CycleState, r
 	}
 
 	// Write per-endpoint prefix-cache match info as endpoint attributes so downstream
-	// scorers (e.g. nohitlru) can determine whether any cache hits were found.
+	// consumers (e.g. nohitlru, prefix-based PD decider, upstream prefix scorer) can
+	// determine cache-hit details. The kvBlockScorer returns matched-block counts,
+	// so we propagate them along with totalBlocks and blockSizeTokens to preserve
+	// the same semantics as PrepareRequestData.
+	blockSize := s.getBlockSizeTokens()
 	for _, endpoint := range endpoints {
 		key, ok := endpointToKey(endpoint)
 		matchBlocks := 0
 		if ok {
 			if rawScore, exists := scores[key]; exists && rawScore > 0 {
-				matchBlocks = 1
+				matchBlocks = int(rawScore)
 			}
 		}
-		endpoint.Put(approxprefix.PrefixCacheMatchInfoKey, approxprefix.NewPrefixCacheMatchInfo(matchBlocks, 1, 1))
+		endpoint.Put(approxprefix.PrefixCacheMatchInfoKey, approxprefix.NewPrefixCacheMatchInfo(matchBlocks, totalBlocks, blockSize))
 	}
 
 	normalizedScores := indexedScoresToNormalizedScoredPods(endpoints, endpointToKey, scores)
