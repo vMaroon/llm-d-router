@@ -47,13 +47,14 @@ const (
 	maxErrorBodySnippetBytes = 1024
 )
 
-// vllmConfig configures the vLLM /render backend. Future protocol fields
-// (e.g., grpc) can be added alongside http.
+// vllmConfig configures the vLLM /render backend. Only plain HTTP is
+// supported (no TLS). Future protocol fields (e.g., grpc) can be added
+// alongside url.
 type vllmConfig struct {
-	// HTTP is the base URL of the vLLM render endpoint (no trailing slash).
+	// URL is the base URL of the vLLM render endpoint (no trailing slash).
 	// Can be a loopback sidecar or a dedicated Service.
 	// Defaults to http://localhost:8000.
-	HTTP string `json:"http,omitempty"`
+	URL string `json:"url,omitempty"`
 	// Timeout is the per-request timeout for text-only requests
 	// (Go duration string, e.g. "5s"). Defaults to 5s.
 	Timeout string `json:"timeout,omitempty"`
@@ -73,7 +74,7 @@ type vllmHTTPRenderer struct {
 }
 
 func newVLLMHTTPRenderer(cfg *vllmConfig, modelName string) (*vllmHTTPRenderer, error) {
-	url := strings.TrimRight(cfg.HTTP, "/")
+	url := strings.TrimRight(cfg.URL, "/")
 	if url == "" {
 		url = defaultHTTPRenderURL
 	}

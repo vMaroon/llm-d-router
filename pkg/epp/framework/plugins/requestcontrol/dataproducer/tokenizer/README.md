@@ -20,14 +20,15 @@ upstream list shape, sorted by placeholder offset.
 ## Backend
 
 The plugin calls vLLM's `/v1/completions/render` and
-`/v1/chat/completions/render` over HTTP. An empty configuration falls back
-to `vllm` with `http://localhost:8000`. Future protocol fields (e.g. `grpc`)
-can be added alongside `http` under the same `vllm` block.
+`/v1/chat/completions/render` over plain HTTP (TLS is not supported). An
+empty configuration falls back to `vllm` with `http://localhost:8000`.
+Future protocol fields (e.g. `grpc`) can be added alongside `url` under
+the same `vllm` block.
 
 > [!WARNING]
 > The `udsTokenizerConfig` backend (gRPC-over-UDS sidecar) is **deprecated**
 > and will be removed in a future release. Existing configs continue to work
-> but emit a deprecation warning at startup. Migrate to `vllm.http`. See
+> but emit a deprecation warning at startup. Migrate to `vllm.url`. See
 > [Migration](#migration-from-udstokenizerconfig) below.
 
 ## Config
@@ -35,7 +36,7 @@ can be added alongside `http` under the same `vllm` block.
 | Parameter        | Default                 | Description                                                       |
 | ---------------- | ----------------------- | ----------------------------------------------------------------- |
 | `modelName`      | – (required)            | Model whose tokenizer should be loaded / sent in render requests. |
-| `vllm.http`      | `http://localhost:8000` | Base URL of the vLLM render endpoint (no trailing slash).         |
+| `vllm.url`       | `http://localhost:8000` | Base URL of the vLLM render endpoint, plain HTTP only (no TLS), no trailing slash. |
 | `vllm.timeout`   | `5s`                    | Per-request timeout for text-only requests.                       |
 | `vllm.mmTimeout` | `30s`                   | Per-request timeout for multimodal requests.                      |
 
@@ -71,7 +72,7 @@ Plugin config — sidecar (loopback):
   parameters:
     modelName: "${MODEL_NAME}"
     vllm:
-      http: "http://localhost:8000"       # optional; this is the default
+      url: "http://localhost:8000"       # optional; this is the default
 ```
 
 Plugin config — dedicated render Service:
@@ -81,7 +82,7 @@ Plugin config — dedicated render Service:
   parameters:
     modelName: "${MODEL_NAME}"
     vllm:
-      http: "http://vllm-render.default.svc.cluster.local:8000"
+      url: "http://vllm-render.default.svc.cluster.local:8000"
 ```
 
 A complete sample config that pairs this with `precise-prefix-cache-scorer`
@@ -112,7 +113,7 @@ After:
   parameters:
     modelName: "${MODEL_NAME}"
     vllm:
-      http: "http://localhost:8000"   # or a shared render Service
+      url: "http://localhost:8000"   # or a shared render Service; plain HTTP only
 ```
 
 See the [Deployment](#deployment) section above for sidecar vs shared-Service

@@ -121,7 +121,7 @@ func NewPlugin(ctx context.Context, name string, config *tokenizerPluginConfig) 
 	switch {
 	case config.TokenizerConfig.IsEnabled():
 		log.FromContext(ctx).Info(
-			"DEPRECATION: 'udsTokenizerConfig' backend is deprecated and will be removed in a future release; migrate to the 'vllm' HTTP /render backend",
+			"DEPRECATION: the 'udsTokenizerConfig' parameter is deprecated and will be removed in a future release; set the 'vllm' parameter instead (see plugin README)",
 			"pluginType", PluginType,
 		)
 		uds, err := newUDSTokenizer(ctx, &config.TokenizerConfig, config.ModelName)
