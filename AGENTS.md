@@ -6,6 +6,8 @@ llm-d Router. Go service that routes inference requests to model-serving pods vi
 
 ## Working in the codebase
 
+- State your interpretation before coding. When the task has multiple valid reads, ask — don't pick one silently.
+- Define success as a checkable outcome — "add validation" becomes "write failing tests for invalid inputs, then make them pass".
 - Before changing or extending a component, read an analogous one in the repository. The closest existing implementation is the canonical pattern — follow its structure, naming, and tests rather than introducing new conventions.
 - The plugin model is the main extension surface. Start at [docs/architecture.md](docs/architecture.md); existing filters, scorers, and profile handlers are the canonical references.
 - Tests in the same package describe the contract. Read them before changing behavior.
