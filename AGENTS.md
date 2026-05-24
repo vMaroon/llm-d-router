@@ -26,6 +26,7 @@ Non-trivial work must be tracked in an issue. If there isn't one, ask the user t
 
 - DCO sign-off is required. Use `git commit -s`.
 - Commit subject: imperative, ~72 characters. Body short and focused on the WHY; long narrative belongs in the PR description.
+- Do not add machine-generated co-author trailers. Sign-off is the only required trailer.
 - Do not bypass hooks (`--no-verify`) or signing checks.
 
 ## Agent operating rules
