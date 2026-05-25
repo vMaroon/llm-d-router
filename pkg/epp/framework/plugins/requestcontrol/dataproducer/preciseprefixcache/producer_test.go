@@ -325,7 +325,10 @@ func TestNew_BlockSizeFlowsViaTokenProcessor(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			ctx := utils.NewTestContext(t)
+			// Cancel on test exit so the indexer.Run + kvevents pool workers
+			// New() launches don't outlive the subtest.
+			ctx, cancel := context.WithCancel(utils.NewTestContext(t))
+			t.Cleanup(cancel)
 
 			idxCfg, err := kvcache.NewDefaultConfig()
 			require.NoError(t, err)
@@ -358,7 +361,8 @@ func TestNew_BlockSizeFlowsViaTokenProcessor(t *testing.T) {
 
 			raw, ok := endpoint.Get(attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName(name).String())
 			require.True(t, ok)
-			info := raw.(*attrprefix.PrefixCacheMatchInfo)
+			info, ok := raw.(*attrprefix.PrefixCacheMatchInfo)
+			require.True(t, ok, "expected *PrefixCacheMatchInfo, got %T", raw)
 			assert.Equal(t, tc.want, info.BlockSizeTokens())
 			assert.Equal(t, 1, info.TotalBlocks())
 		})
