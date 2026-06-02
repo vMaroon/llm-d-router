@@ -49,7 +49,7 @@ func (m *mockTokenizer) RenderChat(_ context.Context, req *tokenizerTypes.Render
 func newTestPlugin(tok tokenizer) *Plugin {
 	return &Plugin{
 		typedName: plugin.TypedName{Type: PluginType, Name: "test"},
-		tokenizer: tok,
+		backend:   renderBackend{tk: tok},
 	}
 }
 
