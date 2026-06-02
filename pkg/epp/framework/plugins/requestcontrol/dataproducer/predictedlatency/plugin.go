@@ -22,7 +22,6 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -290,10 +289,8 @@ func newPredictedLatencyContext(request *fwksched.InferenceRequest) *predictedLa
 	inputTokenCount := 0
 	if request.Body != nil {
 		promptText = request.Body.PromptText()
-		if hint := request.Body.InputTokenCountHint(); hint >= 0 {
-			inputTokenCount = hint
-		} else {
-			inputTokenCount = len(strings.Fields(promptText))
+		if tp := request.Body.TokenizedPrompt; tp != nil {
+			inputTokenCount = len(tp.TokenIDs)
 		}
 	}
 	return &predictedLatencyCtx{

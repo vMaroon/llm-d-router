@@ -67,11 +67,14 @@ func profileNames(m map[string]scheduling.SchedulerProfile) []string {
 	return out
 }
 
-// completionsRequest builds a text-only InferenceRequest.
+// completionsRequest builds a text-only InferenceRequest. The tokenized prompt
+// carries len(prompt)/AverageCharactersPerToken token IDs, which the decider reads
+// as the input token count.
 func completionsRequest(prompt string) *scheduling.InferenceRequest {
 	return &scheduling.InferenceRequest{
 		Body: &fwkrh.InferenceRequestBody{
-			Completions: &fwkrh.CompletionsRequest{Prompt: fwkrh.Prompt{Raw: prompt}},
+			Completions:     &fwkrh.CompletionsRequest{Prompt: fwkrh.Prompt{Raw: prompt}},
+			TokenizedPrompt: &fwkrh.TokenizedPrompt{TokenIDs: make([]uint32, len(prompt)/AverageCharactersPerToken)},
 		},
 	}
 }
@@ -105,9 +108,15 @@ func chatRequest(hasImage, hasVideo, hasAudio bool) *scheduling.InferenceRequest
 	return &scheduling.InferenceRequest{Body: body}
 }
 
-// withPrompt adds a completions body to a chat request so the PD decider can estimate tokens.
+// withPrompt adds a completions body to a chat request and sets the input token
+// count (len(prompt)/AverageCharactersPerToken) on the tokenized prompt, preserving
+// any existing multimodal features.
 func withPrompt(req *scheduling.InferenceRequest, prompt string) *scheduling.InferenceRequest {
 	req.Body.Completions = &fwkrh.CompletionsRequest{Prompt: fwkrh.Prompt{Raw: prompt}}
+	if req.Body.TokenizedPrompt == nil {
+		req.Body.TokenizedPrompt = &fwkrh.TokenizedPrompt{}
+	}
+	req.Body.TokenizedPrompt.TokenIDs = make([]uint32, len(prompt)/AverageCharactersPerToken)
 	return req
 }
 
