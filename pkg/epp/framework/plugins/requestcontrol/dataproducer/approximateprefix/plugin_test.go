@@ -32,6 +32,7 @@ import (
 	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
 	attrprefix "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/prefix"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/tokenizer"
 )
 
 func testHandle() plugin.Handle {
@@ -555,6 +556,168 @@ func BenchmarkPrefixPluginStress(b *testing.B) {
 				p.PluginState().Delete(req.RequestID)
 			}
 		})
+	}
+}
+
+// randomPrompt builds a deterministic varied string of n characters.
+func randomPrompt(n int) string {
+	const charset = "abcdefghijklmnopqrstuvwxyz 0123456789"
+	bts := make([]byte, n)
+	for i := range bts {
+		bts[i] = charset[(i*131+7)%len(charset)]
+	}
+	return string(bts)
+}
+
+// BenchmarkPrefixEstimateEndToEnd measures the refactored path from a raw prompt
+// of v characters: the token-producer (estimate byte-packing) plus
+// approximate.Produce hashing, broken out per stage and combined. The combined
+// "total" is the fair head-to-head with upstream's BenchmarkPrefixPluginStress,
+// which runs approximate.Produce directly on a v-character raw prompt.
+func BenchmarkPrefixEstimateEndToEnd(b *testing.B) {
+	cfg := config{
+		BlockSizeTokens:        16,
+		MaxPrefixBlocksToMatch: 50000,
+		LRUCapacityPerServer:   defaultLRUCapacityPerServer,
+	}
+	approx, _ := newDataProducer(context.Background(), ApproxPrefixCachePluginType, cfg, testHandle())
+
+	tokPlugin, err := tokenizer.PluginFactory("token-producer", plugin.StrictDecoder(json.RawMessage(`{"estimate":{}}`)), testHandle())
+	if err != nil {
+		b.Fatalf("build estimate token-producer: %v", err)
+	}
+	tok := tokPlugin.(*tokenizer.Plugin)
+
+	endpoints := []fwksched.Endpoint{fwksched.NewEndpoint(&fwkdl.EndpointMetadata{
+		NamespacedName: k8stypes.NamespacedName{Name: "pod1"},
+	}, nil, fwkdl.NewAttributes())}
+
+	newReq := func(prompt string) *fwksched.InferenceRequest {
+		return &fwksched.InferenceRequest{
+			RequestID:   uuid.NewString(),
+			TargetModel: "model-stress",
+			Body: &fwkrh.InferenceRequestBody{
+				Completions: &fwkrh.CompletionsRequest{Prompt: fwkrh.Prompt{Raw: prompt}},
+			},
+		}
+	}
+
+	for _, v := range []int{1024, 4096, 10000, 50000} {
+		prompt := randomPrompt(v)
+
+		// Stage 1: token-producer (estimate byte-packing) only.
+		b.Run(fmt.Sprintf("estimate_%d", v), func(b *testing.B) {
+			req := newReq(prompt)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				req.Body.TokenizedPrompt = nil
+				_ = tok.Produce(context.Background(), req, endpoints)
+			}
+		})
+
+		// Stage 2: approximate hashing only, on the estimate-produced tokens.
+		b.Run(fmt.Sprintf("approximate_%d", v), func(b *testing.B) {
+			req := newReq(prompt)
+			_ = tok.Produce(context.Background(), req, endpoints)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				_ = approx.Produce(context.Background(), req, endpoints)
+				approx.PluginState().Delete(req.RequestID)
+			}
+		})
+
+		// Total: estimate + approximate from the raw prompt (head-to-head).
+		b.Run(fmt.Sprintf("total_%d", v), func(b *testing.B) {
+			req := newReq(prompt)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				req.Body.TokenizedPrompt = nil
+				_ = tok.Produce(context.Background(), req, endpoints)
+				_ = approx.Produce(context.Background(), req, endpoints)
+				approx.PluginState().Delete(req.RequestID)
+			}
+		})
+	}
+}
+
+// benchSink prevents the compiler from eliminating the count-reader work.
+var benchSink int
+
+// BenchmarkPrefixAmortization shows how token-derivation cost scales with the
+// number of token-consumers under two regimes, at a fixed 4096-char prompt:
+//   - shared: the token-producer derives once; the prefix consumer hashes and
+//     each additional consumer reads len(TokenIDs) (context-length / P/D /
+//     in-flight load). This is the refactored design.
+//   - perconsumer: every consumer derives its own tokens before using them,
+//     modeling the pre-refactor world where consumers did not share a
+//     TokenizedPrompt. Derivation cost is estimate.produce in both.
+//
+// "consumers_K" means one hashing consumer plus K-1 count-readers.
+func BenchmarkPrefixAmortization(b *testing.B) {
+	cfg := config{
+		BlockSizeTokens:        16,
+		MaxPrefixBlocksToMatch: 50000,
+		LRUCapacityPerServer:   defaultLRUCapacityPerServer,
+	}
+	approx, _ := newDataProducer(context.Background(), ApproxPrefixCachePluginType, cfg, testHandle())
+	tokPlugin, err := tokenizer.PluginFactory("token-producer", plugin.StrictDecoder(json.RawMessage(`{"estimate":{}}`)), testHandle())
+	if err != nil {
+		b.Fatalf("build estimate token-producer: %v", err)
+	}
+	tok := tokPlugin.(*tokenizer.Plugin)
+
+	endpoints := []fwksched.Endpoint{fwksched.NewEndpoint(&fwkdl.EndpointMetadata{
+		NamespacedName: k8stypes.NamespacedName{Name: "pod1"},
+	}, nil, fwkdl.NewAttributes())}
+	ctx := context.Background()
+	newReq := func(prompt string) *fwksched.InferenceRequest {
+		return &fwksched.InferenceRequest{
+			RequestID:   uuid.NewString(),
+			TargetModel: "model-stress",
+			Body:        &fwkrh.InferenceRequestBody{Completions: &fwkrh.CompletionsRequest{Prompt: fwkrh.Prompt{Raw: prompt}}},
+		}
+	}
+
+	for _, v := range []int{1024, 4096, 10000, 50000} {
+		prompt := randomPrompt(v)
+		for _, consumers := range []int{1, 2, 3, 4} {
+			readers := consumers - 1 // count-readers beyond the one hashing consumer
+
+			b.Run(fmt.Sprintf("shared_len%d_consumers%d", v, consumers), func(b *testing.B) {
+				req := newReq(prompt)
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					req.Body.TokenizedPrompt = nil
+					_ = tok.Produce(ctx, req, endpoints) // derive once
+					_ = approx.Produce(ctx, req, endpoints)
+					approx.PluginState().Delete(req.RequestID)
+					for j := 0; j < readers; j++ {
+						benchSink += len(req.Body.TokenizedPrompt.TokenIDs)
+					}
+				}
+			})
+
+			b.Run(fmt.Sprintf("perconsumer_len%d_consumers%d", v, consumers), func(b *testing.B) {
+				req := newReq(prompt)
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					req.Body.TokenizedPrompt = nil
+					_ = tok.Produce(ctx, req, endpoints) // prefix consumer derives
+					_ = approx.Produce(ctx, req, endpoints)
+					approx.PluginState().Delete(req.RequestID)
+					for j := 0; j < readers; j++ {
+						req.Body.TokenizedPrompt = nil
+						_ = tok.Produce(ctx, req, endpoints) // each count-reader re-derives
+						benchSink += len(req.Body.TokenizedPrompt.TokenIDs)
+					}
+				}
+			})
+		}
 	}
 }
 
