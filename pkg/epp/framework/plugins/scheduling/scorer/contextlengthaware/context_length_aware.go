@@ -203,15 +203,10 @@ func (p *ContextLengthAware) Category() scheduling.ScorerCategory {
 // from InferenceRequestBody.TokenizedPrompt as populated by the tokenizer DataProducer
 // plugin. When tokens are unavailable it returns 0 (unknown).
 func getContextLength(request *scheduling.InferenceRequest) int {
-	if request == nil || request.Body == nil {
+	if request == nil || request.Body == nil || request.Body.TokenizedPrompt == nil {
 		return 0
 	}
-
-	if tp := request.Body.TokenizedPrompt; tp != nil {
-		return len(tp.TokenIDs)
-	}
-
-	return 0
+	return len(request.Body.TokenizedPrompt.TokenIDs)
 }
 
 // parseContextRange parses a label value into a single context range.

@@ -20,6 +20,10 @@ import (
 const (
 	testEndpointAddr = "10.0.0.1"
 	testEndpointPort = "8000"
+
+	// averageCharactersPerToken derives token counts from character-length
+	// prompt fixtures in tests.
+	averageCharactersPerToken = 4
 )
 
 // notPrefixCacheMatchInfo is a Cloneable type that is not *PrefixCacheMatchInfo, used to test type assertion failure.
@@ -54,7 +58,7 @@ func makeTestEndpoint(cachedTokens int) scheduling.Endpoint {
 // makeRequestWithTokens creates a completions request whose tokenized prompt carries
 // the given token count, which getUserInputLenInTokens reads as the input length.
 func makeRequestWithTokens(tokens int) *scheduling.InferenceRequest {
-	return completionsRequest(strings.Repeat("x", tokens*AverageCharactersPerToken))
+	return completionsRequest(strings.Repeat("x", tokens*averageCharactersPerToken))
 }
 
 // withTokens sets the tokenized prompt to carry n token IDs, which the decider reads
