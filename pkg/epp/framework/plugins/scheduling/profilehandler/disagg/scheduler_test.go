@@ -28,15 +28,19 @@ import (
 const (
 	prefill = "prefill"
 	decode  = "decode"
+
+	// averageCharactersPerToken derives token counts from character-length
+	// prompt fixtures in tests.
+	averageCharactersPerToken = 4
 )
 
 // completionsBody builds a completions request body whose tokenized prompt carries
-// len(prompt)/disagg.AverageCharactersPerToken token IDs, which the decider reads as
+// len(prompt)/averageCharactersPerToken token IDs, which the decider reads as
 // the input token count.
 func completionsBody(prompt string) *fwkrh.InferenceRequestBody {
 	return &fwkrh.InferenceRequestBody{
 		Completions:     &fwkrh.CompletionsRequest{Prompt: fwkrh.Prompt{Raw: prompt}},
-		TokenizedPrompt: &fwkrh.TokenizedPrompt{TokenIDs: make([]uint32, len(prompt)/disagg.AverageCharactersPerToken)},
+		TokenizedPrompt: &fwkrh.TokenizedPrompt{TokenIDs: make([]uint32, len(prompt)/averageCharactersPerToken)},
 	}
 }
 
@@ -246,7 +250,7 @@ func TestPDSchedule(t *testing.T) {
 			})
 			scheduler := scheduling.NewSchedulerWithConfig(schedulerConfig)
 
-			inputTokens := len(test.req.Body.Completions.Prompt.Raw) / disagg.AverageCharactersPerToken
+			inputTokens := len(test.req.Body.Completions.Prompt.Raw) / averageCharactersPerToken
 			for _, pod := range test.input {
 				pod.Put(attrprefix.PrefixCacheMatchInfoDataKey.String(), attrprefix.NewPrefixCacheMatchInfo(0, inputTokens, 1))
 			}

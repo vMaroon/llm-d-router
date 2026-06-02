@@ -17,10 +17,6 @@ import (
 const (
 	// PrefixBasedPDDeciderPluginType is the type-name of the prefixBasedPDDecider plugin.
 	PrefixBasedPDDeciderPluginType = "prefix-based-pd-decider"
-
-	// AverageCharactersPerToken is an estimated average characters per token,
-	// used by tests to derive token counts from character-length prompt fixtures.
-	AverageCharactersPerToken = 4
 )
 
 // PrefixBasedPDDeciderConfig holds the configuration for the prefixBasedPDDecider plugin.

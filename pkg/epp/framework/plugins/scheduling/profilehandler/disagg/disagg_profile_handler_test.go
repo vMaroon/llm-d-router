@@ -68,13 +68,13 @@ func profileNames(m map[string]scheduling.SchedulerProfile) []string {
 }
 
 // completionsRequest builds a text-only InferenceRequest. The tokenized prompt
-// carries len(prompt)/AverageCharactersPerToken token IDs, which the decider reads
+// carries len(prompt)/averageCharactersPerToken token IDs, which the decider reads
 // as the input token count.
 func completionsRequest(prompt string) *scheduling.InferenceRequest {
 	return &scheduling.InferenceRequest{
 		Body: &fwkrh.InferenceRequestBody{
 			Completions:     &fwkrh.CompletionsRequest{Prompt: fwkrh.Prompt{Raw: prompt}},
-			TokenizedPrompt: &fwkrh.TokenizedPrompt{TokenIDs: make([]uint32, len(prompt)/AverageCharactersPerToken)},
+			TokenizedPrompt: &fwkrh.TokenizedPrompt{TokenIDs: make([]uint32, len(prompt)/averageCharactersPerToken)},
 		},
 	}
 }
@@ -109,14 +109,14 @@ func chatRequest(hasImage, hasVideo, hasAudio bool) *scheduling.InferenceRequest
 }
 
 // withPrompt adds a completions body to a chat request and sets the input token
-// count (len(prompt)/AverageCharactersPerToken) on the tokenized prompt, preserving
+// count (len(prompt)/averageCharactersPerToken) on the tokenized prompt, preserving
 // any existing multimodal features.
 func withPrompt(req *scheduling.InferenceRequest, prompt string) *scheduling.InferenceRequest {
 	req.Body.Completions = &fwkrh.CompletionsRequest{Prompt: fwkrh.Prompt{Raw: prompt}}
 	if req.Body.TokenizedPrompt == nil {
 		req.Body.TokenizedPrompt = &fwkrh.TokenizedPrompt{}
 	}
-	req.Body.TokenizedPrompt.TokenIDs = make([]uint32, len(prompt)/AverageCharactersPerToken)
+	req.Body.TokenizedPrompt.TokenIDs = make([]uint32, len(prompt)/averageCharactersPerToken)
 	return req
 }
 
@@ -435,7 +435,7 @@ func TestHandler_Pick_PD(t *testing.T) {
 			h := NewDisaggProfileHandler(defaultDecodeProfile, defaultPrefillProfile, "",
 				decider, nil)
 
-			inputTokens := len(req.Body.Completions.Prompt.Raw) / AverageCharactersPerToken
+			inputTokens := len(req.Body.Completions.Prompt.Raw) / averageCharactersPerToken
 			injectPrefixCache(tt.profileResults, tt.cachedTokens, inputTokens)
 
 			got := h.Pick(ctx, req, profiles, tt.profileResults)
@@ -494,7 +494,7 @@ func TestHandler_Pick_PD_Series(t *testing.T) {
 				want         []string
 			}{
 				{short, 0, []string{defaultPrefillProfile}},
-				{short, len(short.Body.Completions.Prompt.Raw) / AverageCharactersPerToken, []string{}},
+				{short, len(short.Body.Completions.Prompt.Raw) / averageCharactersPerToken, []string{}},
 			},
 		},
 		{
@@ -506,7 +506,7 @@ func TestHandler_Pick_PD_Series(t *testing.T) {
 				want         []string
 			}{
 				{short, 0, []string{defaultPrefillProfile}},
-				{long, len(short.Body.Completions.Prompt.Raw) / AverageCharactersPerToken, []string{defaultPrefillProfile}},
+				{long, len(short.Body.Completions.Prompt.Raw) / averageCharactersPerToken, []string{defaultPrefillProfile}},
 			},
 		},
 	}
@@ -523,7 +523,7 @@ func TestHandler_Pick_PD_Series(t *testing.T) {
 				results := map[string]*scheduling.ProfileRunResult{
 					defaultDecodeProfile: makeProfileRunResult("pod1"),
 				}
-				inputTokens := len(step.req.Body.Completions.Prompt.Raw) / AverageCharactersPerToken
+				inputTokens := len(step.req.Body.Completions.Prompt.Raw) / averageCharactersPerToken
 				injectPrefixCache(results, step.cachedTokens, inputTokens)
 				got := h.Pick(ctx, step.req, profiles, results)
 				assert.ElementsMatch(t, step.want, profileNames(got))
@@ -941,10 +941,10 @@ func TestHandler_Pick_EPD_Full(t *testing.T) {
 
 			inputTokens := 0
 			if tt.req.Body.Completions != nil {
-				inputTokens = len(tt.req.Body.Completions.Prompt.Raw) / AverageCharactersPerToken
+				inputTokens = len(tt.req.Body.Completions.Prompt.Raw) / averageCharactersPerToken
 			} else if tt.req.Body.ChatCompletions != nil {
 				b, _ := json.Marshal(tt.req.Body.ChatCompletions.Messages)
-				inputTokens = len(b) / AverageCharactersPerToken
+				inputTokens = len(b) / averageCharactersPerToken
 			}
 			injectPrefixCache(tt.results, tt.cachedTokens, inputTokens)
 
@@ -988,7 +988,7 @@ func TestHandler_Pick_EPD_Full_EncodeDecider(t *testing.T) {
 				defaultDecodeProfile: makeProfileRunResult("pod1"),
 			}
 
-			inputTokens := len(testLongPrompt) / AverageCharactersPerToken
+			inputTokens := len(testLongPrompt) / averageCharactersPerToken
 			injectPrefixCache(results, 0, inputTokens)
 
 			got := h.Pick(ctx, multimodalLong, profiles, results)
@@ -1167,7 +1167,7 @@ func TestHandler_Pick_NilDeciders(t *testing.T) {
 
 			// Inject prefix cache if needed for PD decider
 			if tt.req.Body.Completions != nil {
-				inputTokens := len(tt.req.Body.Completions.Prompt.Raw) / AverageCharactersPerToken
+				inputTokens := len(tt.req.Body.Completions.Prompt.Raw) / averageCharactersPerToken
 				injectPrefixCache(tt.results, 0, inputTokens)
 			}
 
