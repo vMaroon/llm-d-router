@@ -223,11 +223,12 @@ func (p *dataProducer) PreRequest(ctx context.Context, request *fwksched.Inferen
 		}
 	})
 
-	// Record metrics. Lengths are reported in tokens.
+	// prefix_indexer_hit_bytes reports a byte estimate (~approxBytesPerToken bytes/token).
+	const approxBytesPerToken = 4
 	total := len(state.PrefixHashes)
 	matchLen := state.PrefixCacheServers[ServerID(targetEndpoint.GetMetadata().NamespacedName)]
 	blockSize := p.GetBlockSize(primaryProfileResult.TargetEndpoints)
-	recordPrefixCacheMatch(matchLen*blockSize, total*blockSize)
+	recordPrefixCacheMatch(matchLen*blockSize*approxBytesPerToken, total*blockSize*approxBytesPerToken)
 }
 
 func (p *dataProducer) makeserver(targetEndpoint fwksched.Endpoint) server {
