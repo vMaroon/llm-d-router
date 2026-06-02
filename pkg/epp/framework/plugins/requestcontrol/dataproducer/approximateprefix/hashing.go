@@ -68,10 +68,22 @@ func getBlockHashes(ctx context.Context, request *scheduling.InferenceRequest, b
 		return nil
 	}
 
-	seq, err := getKVCacheBlocksFromRawPrompt(ctx, request, blockSizeTokens, tokenEstimator)
-	if err != nil {
-		loggerDebug.Error(err, "Failed to get kv cache blocks")
-		return nil
+	// Prefer the tokenized representation when a token-producer backend has
+	// populated it (the estimate backend included): the scorer hashes token
+	// blocks and stays agnostic to how the tokens were derived. Fall back to
+	// in-scorer serialization only when no TokenizedPrompt is present. Once the
+	// estimate backend is the configured producer, this fallback is dead and
+	// the serialization below moves out of the scorer entirely.
+	var seq iter.Seq[HashBlock]
+	if tp := request.Body.TokenizedPrompt; tp != nil && len(tp.TokenIDs) > 0 {
+		seq = getKVCacheBlocksFromTokens(tp.TokenIDs, blockSizeTokens)
+	} else {
+		var err error
+		seq, err = getKVCacheBlocksFromRawPrompt(ctx, request, blockSizeTokens, tokenEstimator)
+		if err != nil {
+			loggerDebug.Error(err, "Failed to get kv cache blocks")
+			return nil
+		}
 	}
 
 	blockHashes := computeBlockHashes(seq, request, maxPrefixBlocks)
