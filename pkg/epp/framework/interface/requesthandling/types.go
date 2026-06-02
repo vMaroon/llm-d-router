@@ -168,22 +168,6 @@ func (r *InferenceRequestBody) PromptText() string {
 	}
 }
 
-// InputTokenCountHint returns a best-effort input token count when the
-// caller knows it exactly (token-ID inputs), or -1 when the count has
-// to be estimated from text.
-func (r *InferenceRequestBody) InputTokenCountHint() int {
-	if r.Completions != nil {
-		return r.Completions.Prompt.TokenCountHint()
-	}
-	if r.Embeddings != nil {
-		return r.Embeddings.Input.TokenCountHint()
-	}
-	if r.Generate != nil {
-		return len(r.Generate.TokenIDs)
-	}
-	return -1
-}
-
 func (r *InferenceRequestBody) CacheSalt() string {
 	if r.Conversations != nil {
 		return r.Conversations.CacheSalt

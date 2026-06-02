@@ -214,13 +214,16 @@ func (p *mockSchedulerProfile) Run(_ context.Context, _ *scheduling.InferenceReq
 	return &scheduling.ProfileRunResult{}, nil
 }
 
-// creates and returns llm completion request forthe given prompt
+// creates and returns llm completion request for the given prompt. The tokenized
+// prompt carries len(prompt)/AverageCharactersPerToken token IDs, which the decider
+// reads as the input token count.
 func createRequest(prompt string) *scheduling.InferenceRequest {
 	return &scheduling.InferenceRequest{
 		Body: &fwkrh.InferenceRequestBody{
 			Completions: &fwkrh.CompletionsRequest{
 				Prompt: fwkrh.Prompt{Raw: prompt},
 			},
+			TokenizedPrompt: &fwkrh.TokenizedPrompt{TokenIDs: make([]uint32, len(prompt)/AverageCharactersPerToken)},
 		},
 	}
 }
