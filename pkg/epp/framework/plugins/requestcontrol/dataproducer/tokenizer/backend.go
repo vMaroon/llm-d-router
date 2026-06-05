@@ -85,7 +85,8 @@ func (b renderBackend) warmup(ctx context.Context) {
 
 // warmupChat builds a single-message chat body carrying the given image URLs.
 func warmupChat(imageURLs ...string) *fwkrh.InferenceRequestBody {
-	blocks := []fwkrh.ContentBlock{{Type: "text", Text: "warmup"}}
+	blocks := make([]fwkrh.ContentBlock, 0, 1+len(imageURLs))
+	blocks = append(blocks, fwkrh.ContentBlock{Type: "text", Text: "warmup"})
 	for _, url := range imageURLs {
 		blocks = append(blocks, fwkrh.ContentBlock{Type: "image_url", ImageURL: fwkrh.ImageBlock{URL: url}})
 	}
