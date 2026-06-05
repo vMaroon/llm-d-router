@@ -207,11 +207,14 @@ func (p *Producer) Produces() map[plugin.DataKey]any {
 	return map[plugin.DataKey]any{p.dk: attrprefix.PrefixCacheMatchInfo{}}
 }
 
-// Consumes declares the TokenizedPrompt dependency from token-producer so
-// the data-layer DAG orders tokenization before this producer runs.
+// Consumes requires EngineTokenizedPrompt: this producer hashes tokens into
+// KV-block keys that must match the engine's, so it depends on a render
+// (vllm/uds) token-producer. The dependency both orders tokenization first and,
+// since EngineTokenizedPrompt has no default producer, fails startup when no
+// such token-producer is configured (rather than accepting estimate tokens).
 func (p *Producer) Consumes() plugin.DataDependencies {
 	return plugin.DataDependencies{
-		Required: map[plugin.DataKey]any{tokenproducer.TokenizedPromptDataKey: scheduling.TokenizedPrompt{}},
+		Required: map[plugin.DataKey]any{tokenproducer.EngineTokenizedPromptDataKey: scheduling.TokenizedPrompt{}},
 	}
 }
 

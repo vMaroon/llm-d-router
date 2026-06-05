@@ -303,11 +303,16 @@ func TestProduces_DeclaresPrefixCacheMatchInfo(t *testing.T) {
 	require.True(t, ok)
 }
 
-func TestConsumes_DeclaresTokenizedPrompt(t *testing.T) {
+func TestConsumes_DeclaresEngineTokenizedPrompt(t *testing.T) {
 	p := &Producer{typedName: plugin.TypedName{Type: PluginType, Name: "x"}}
-	expected := plugin.NewDataKey("TokenizedPrompt", "token-producer")
+	// Requires the engine-tokens key (no default producer) rather than the
+	// generic TokenizedPrompt key, so a config without a vllm token-producer
+	// fails at startup instead of receiving estimate pseudo-tokens.
+	expected := plugin.NewDataKey("EngineTokenizedPrompt", "token-producer")
 	_, ok := p.Consumes().Required[expected]
 	require.True(t, ok)
+	_, hasGeneric := p.Consumes().Required[plugin.NewDataKey("TokenizedPrompt", "token-producer")]
+	require.False(t, hasGeneric)
 }
 
 // New() must resolve blockSize via tokenProcessor.BlockSize(). Both the

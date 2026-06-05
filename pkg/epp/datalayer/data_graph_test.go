@@ -356,6 +356,15 @@ func TestCreateMissingDataProducers(t *testing.T) {
 			wantTypes:       nil,
 		},
 		{
+			name: "required key with no registered default returns error",
+			existingPlugins: []fwkplugin.Plugin{
+				&MockSchedulingPlugin{consumes: map[fwkplugin.DataKey]any{keyA: nil}},
+			},
+			defaultProducerRegistry: map[string]string{}, // keyA has no default producer
+			factoryRegistry:         map[string]fwkplugin.FactoryFunc{},
+			wantErr:                 true,
+		},
+		{
 			name: "failing factory returns error",
 			existingPlugins: []fwkplugin.Plugin{
 				&MockSchedulingPlugin{consumes: map[fwkplugin.DataKey]any{keyAFailing: nil}},

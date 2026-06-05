@@ -33,10 +33,11 @@ Backend selection:
 
 > [!WARNING]
 > The `estimate` backend approximates token boundaries (≈4 bytes/token); its
-> token IDs do not correspond to engine tokens. The precise prefix-cache scorer
-> requires real tokens — configure a `vllm` `token-producer` explicitly for it.
-> If omitted, the auto-created `estimate` producer satisfies the dependency but
-> silently degrades precise cache correlation.
+> token IDs do not correspond to engine tokens. The precise prefix-cache
+> scorer/producer requires real tokens, so it must be paired with an explicit
+> `vllm` `token-producer`. A precise config with no `vllm` token-producer is
+> rejected at startup rather than silently served the auto-created `estimate`
+> producer.
 
 > [!WARNING]
 > The `udsTokenizerConfig` backend (gRPC-over-UDS sidecar) is **deprecated**

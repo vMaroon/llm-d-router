@@ -52,10 +52,22 @@ const (
 	// Deprecated: use PluginType ("token-producer") instead.
 	LegacyPluginType = "tokenizer"
 
-	tokenizedPromptKeyID = "TokenizedPrompt"
+	tokenizedPromptKeyID       = "TokenizedPrompt"
+	engineTokenizedPromptKeyID = "EngineTokenizedPrompt"
 )
 
+// TokenizedPromptDataKey is produced by every backend and consumed by plugins
+// that tolerate estimate pseudo-tokens (approximate prefix cache, context-length,
+// P/D routing). The estimate backend is its registered default producer.
 var TokenizedPromptDataKey = plugin.NewDataKey(tokenizedPromptKeyID, PluginType)
+
+// EngineTokenizedPromptDataKey is produced only by the render backends
+// (vllm/uds), which emit real engine token IDs. Plugins whose correctness
+// depends on engine-exact tokens (precise prefix-cache) consume it. No default
+// producer is registered for it, so a config consuming it without an explicit
+// vllm token-producer fails at startup in CreateMissingDataProducers rather than
+// being silently served the estimate backend's pseudo-tokens.
+var EngineTokenizedPromptDataKey = plugin.NewDataKey(engineTokenizedPromptKeyID, PluginType)
 
 // tokenizerPluginConfig holds the configuration for the tokenizer plugin.
 //
@@ -199,6 +211,7 @@ func NewPlugin(ctx context.Context, name string, config *tokenizerPluginConfig) 
 		typedName: plugin.TypedName{Type: PluginType, Name: name},
 		backend:   backend,
 		dk:        TokenizedPromptDataKey.WithNonEmptyProducerName(name),
+		engineDK:  EngineTokenizedPromptDataKey.WithNonEmptyProducerName(name),
 	}, nil
 }
 
@@ -208,6 +221,7 @@ type Plugin struct {
 	typedName plugin.TypedName
 	backend   tokenInputProducer
 	dk        plugin.DataKey
+	engineDK  plugin.DataKey
 }
 
 // compile-time assertion.
@@ -218,9 +232,15 @@ func (p *Plugin) TypedName() plugin.TypedName {
 	return p.typedName
 }
 
-// Produces returns the data keys this plugin produces.
+// Produces returns the data keys this plugin produces. Render backends also
+// produce EngineTokenizedPromptDataKey, signalling engine-exact tokens that the
+// estimate backend cannot satisfy.
 func (p *Plugin) Produces() map[plugin.DataKey]any {
-	return map[plugin.DataKey]any{p.dk: fwkrh.TokenizedPrompt{}}
+	out := map[plugin.DataKey]any{p.dk: fwkrh.TokenizedPrompt{}}
+	if _, estimate := p.backend.(estimateBackend); !estimate {
+		out[p.engineDK] = fwkrh.TokenizedPrompt{}
+	}
+	return out
 }
 
 // Produce derives the request's TokenizedPrompt via the configured backend and
