@@ -54,9 +54,9 @@ import (
 )
 
 const (
-	// TODO(https://github.com/kubernetes-sigs/gateway-api-inference-extension/issues/2081):
-	// Make this timeout configurable per-plugin or globally via the Director configuration to support plugins with
-	// varying latency profiles.
+	// dataProducerTimeout is the default budget for running all DataProducer
+	// plugins. A producer whose work has a higher latency profile overrides it
+	// by implementing requestcontrol.TimeoutAwareProducer.
 	dataProducerTimeout       = 400 * time.Millisecond
 	responseBodyQueueCapacity = 100
 )
@@ -603,10 +603,11 @@ func (d *Director) runPreAdmissionPlugins(ctx context.Context, request *fwksched
 
 func (d *Director) runDataProducerPlugins(ctx context.Context,
 	request *fwksched.InferenceRequest, endpoints []fwksched.Endpoint) error {
-	if len(d.requestControlPlugins.dataProducerPlugins) == 0 {
+	plugins := d.requestControlPlugins.dataProducerPlugins
+	if len(plugins) == 0 {
 		return nil
 	}
-	return dataProducerPluginsWithTimeout(ctx, dataProducerTimeout, d.requestControlPlugins.dataProducerPlugins, request, endpoints)
+	return dataProducerPluginsWithTimeout(ctx, effectiveDataProducerTimeout(plugins), plugins, request, endpoints)
 }
 
 func (d *Director) runAdmissionPlugins(ctx context.Context,

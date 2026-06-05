@@ -18,6 +18,7 @@ package requestcontrol
 
 import (
 	"context"
+	"time"
 
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
@@ -70,6 +71,16 @@ type ResponseBodyProcessor interface {
 type DataProducer interface {
 	plugin.ProducerPlugin
 	Produce(ctx context.Context, request *fwksched.InferenceRequest, pods []fwksched.Endpoint) error
+}
+
+// TimeoutAwareProducer is an optional interface a DataProducer may implement to
+// raise the data-producer execution deadline above the director's default. A
+// producer whose work can legitimately exceed it (e.g. tokenization or
+// multimodal input download) returns the timeout it already manages internally;
+// the director uses the largest value declared across producers. A non-positive
+// value keeps the default.
+type TimeoutAwareProducer interface {
+	ProduceTimeout() time.Duration
 }
 
 // Admitter is called by the director after the data producer and before scheduling.

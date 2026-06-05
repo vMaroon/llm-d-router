@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
 )
@@ -28,6 +29,21 @@ import (
 // in fidelity (render vs estimate); callers never branch on which produced it.
 type tokenInputProducer interface {
 	produce(ctx context.Context, body *fwkrh.InferenceRequestBody) (*fwkrh.TokenizedPrompt, error)
+}
+
+// timeoutAware is implemented by backends (and the tokenizers they wrap) whose
+// produce step can exceed the default data-producer timeout and that manage
+// their own. The plugin surfaces it so the director extends its budget.
+type timeoutAware interface {
+	produceTimeout() time.Duration
+}
+
+// produceTimeout reports the wrapped tokenizer's timeout when it manages one.
+func (b renderBackend) produceTimeout() time.Duration {
+	if ta, ok := b.tk.(timeoutAware); ok {
+		return ta.produceTimeout()
+	}
+	return 0
 }
 
 // renderBackend produces real token IDs and owns protocol dispatch, including

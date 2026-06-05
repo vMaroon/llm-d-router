@@ -25,6 +25,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"time"
 
 	"github.com/llm-d/llm-d-kv-cache/pkg/kvcache/kvblock"
 	"github.com/llm-d/llm-d-kv-cache/pkg/tokenization"
@@ -210,8 +211,11 @@ type Plugin struct {
 	dk        plugin.DataKey
 }
 
-// compile-time assertion.
-var _ requestcontrol.DataProducer = &Plugin{}
+// compile-time assertions.
+var (
+	_ requestcontrol.DataProducer         = &Plugin{}
+	_ requestcontrol.TimeoutAwareProducer = &Plugin{}
+)
 
 // TypedName returns the typed name of the plugin.
 func (p *Plugin) TypedName() plugin.TypedName {
@@ -221,6 +225,16 @@ func (p *Plugin) TypedName() plugin.TypedName {
 // Produces returns the data keys this plugin produces.
 func (p *Plugin) Produces() map[plugin.DataKey]any {
 	return map[plugin.DataKey]any{p.dk: fwkrh.TokenizedPrompt{}}
+}
+
+// ProduceTimeout surfaces the backend's render timeout when it manages one, so
+// the director extends the data-producer budget past its default. Returns 0 to
+// keep the default (e.g. the estimate backend, which is in-memory).
+func (p *Plugin) ProduceTimeout() time.Duration {
+	if ta, ok := p.backend.(timeoutAware); ok {
+		return ta.produceTimeout()
+	}
+	return 0
 }
 
 // Produce derives the request's TokenizedPrompt via the configured backend and
