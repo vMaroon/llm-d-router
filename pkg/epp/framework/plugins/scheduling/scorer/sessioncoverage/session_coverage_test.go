@@ -526,6 +526,70 @@ func TestInFlightOrphansExpire(t *testing.T) {
 	expectScore(t, scores, podB, 0.5)
 }
 
+// dynamoRequest builds a chat request carrying the Dynamo
+// nvext.session_control dialect in its body payload instead of headers.
+func dynamoRequest(sid, action string, chars int) *fwksched.InferenceRequest {
+	r := chatRequest("", chars)
+	r.Body.Payload = fwkrh.PayloadMap(map[string]any{
+		"nvext": map[string]any{
+			"session_control": map[string]any{"session_id": sid, "action": action},
+		},
+	})
+	return r
+}
+
+func TestDynamoDialectCarriesSessionIdentity(t *testing.T) {
+	s, _ := newTestScorer(parameters{})
+	podA, podB := newEndpoint("pod-a"), newEndpoint("pod-b")
+
+	s.PreRequest(context.Background(), dynamoRequest("conv-1", "bind", 4000), schedulingResultFor(podA))
+
+	scores := s.Score(context.Background(), dynamoRequest("conv-1", "bind", 4800), []fwksched.Endpoint{podA, podB})
+	expectScore(t, scores, podA, 1001.0/1201.0)
+	expectScore(t, scores, podB, 0.0)
+}
+
+func TestDynamoCloseReleasesSession(t *testing.T) {
+	s, _ := newTestScorer(parameters{})
+	podA := newEndpoint("pod-a")
+
+	bindTurn := dynamoRequest("conv-1", "bind", 4000)
+	s.PreRequest(context.Background(), bindTurn, schedulingResultFor(podA))
+	s.ResponseBody(context.Background(), bindTurn, endOfStreamResponse(1200, 50), podA.GetMetadata())
+
+	// The final turn still routes with affinity, then releases the entry.
+	closeTurn := dynamoRequest("conv-1", "close", 4400)
+	scores := s.Score(context.Background(), closeTurn, []fwksched.Endpoint{podA})
+	if scores[podA] <= 0 {
+		t.Fatalf("final turn must still score its session's endpoint: %v", scores)
+	}
+	s.ResponseBody(context.Background(), closeTurn, endOfStreamResponse(1400, 50), podA.GetMetadata())
+
+	s.mu.Lock()
+	_, exists := s.sessions["conv-1"]
+	s.mu.Unlock()
+	if exists {
+		t.Error("close action must release the session entry")
+	}
+}
+
+func TestHeaderPrecedesDynamoDialect(t *testing.T) {
+	s, _ := newTestScorer(parameters{})
+	podA := newEndpoint("pod-a")
+
+	r := dynamoRequest("nvext-id", "bind", 4000)
+	r.Headers[defaultHeaderName] = "header-id"
+	s.PreRequest(context.Background(), r, schedulingResultFor(podA))
+
+	s.mu.Lock()
+	_, headerExists := s.sessions["header-id"]
+	_, nvextExists := s.sessions["nvext-id"]
+	s.mu.Unlock()
+	if !headerExists || nvextExists {
+		t.Errorf("header must take precedence: header=%v nvext=%v", headerExists, nvextExists)
+	}
+}
+
 func TestFactoryDefaults(t *testing.T) {
 	p, err := Factory("session-coverage", nil, nil)
 	if err != nil {

@@ -587,6 +587,14 @@ func (s *SessionCoverage) ResponseBody(ctx context.Context, request *fwksched.In
 		}
 	}
 
+	// A declared final turn (Dynamo dialect action "close") releases the
+	// session's index entry once its response has been accounted.
+	if sid != "" {
+		if _, action := dynamoSessionControl(request); action == "close" {
+			s.release(sid)
+		}
+	}
+
 	if logger := log.FromContext(ctx); logger.V(logutil.TRACE).Enabled() {
 		cached := 0
 		if response.Usage.PromptTokenDetails != nil {
@@ -694,7 +702,8 @@ func (s *SessionCoverage) headerValue(request *fwksched.InferenceRequest, name s
 }
 
 // sessionID resolves the request's session id: the session-id-producer
-// attribute when present, otherwise the configured request header.
+// attribute when present, then the configured request header, then the Dynamo
+// nvext.session_control dialect carried in the request body.
 func (s *SessionCoverage) sessionID(request *fwksched.InferenceRequest) string {
 	if request == nil {
 		return ""
@@ -702,10 +711,48 @@ func (s *SessionCoverage) sessionID(request *fwksched.InferenceRequest) string {
 	if id, ok := attrsession.ReadSessionID(request); ok && id != "" {
 		return string(id)
 	}
-	if request.Headers == nil {
-		return ""
+	if request.Headers != nil {
+		if id := strings.TrimSpace(request.Headers[s.headerName]); id != "" {
+			return id
+		}
 	}
-	return strings.TrimSpace(request.Headers[s.headerName])
+	id, _ := dynamoSessionControl(request)
+	return id
+}
+
+// dynamoSessionControl extracts the Dynamo session dialect from the request
+// body: {"nvext": {"session_control": {"session_id": "...", "action":
+// "bind"|"open"|"close"}}}. Trace replayers (e.g. AIPerf conversation-aware
+// routing) and Dynamo clients emit it on every turn of a conversation;
+// adopting it as an identity carrier needs no new client-visible fields.
+// Model servers tolerate the extra field, so it is purely advisory.
+func dynamoSessionControl(request *fwksched.InferenceRequest) (id, action string) {
+	if request == nil || request.Body == nil || request.Body.Payload == nil {
+		return "", ""
+	}
+	payload, ok := request.Body.Payload.AsMap()
+	if !ok {
+		return "", ""
+	}
+	nvext, ok := payload["nvext"].(map[string]any)
+	if !ok {
+		return "", ""
+	}
+	sessionControl, ok := nvext["session_control"].(map[string]any)
+	if !ok {
+		return "", ""
+	}
+	id, _ = sessionControl["session_id"].(string)
+	action, _ = sessionControl["action"].(string)
+	return strings.TrimSpace(id), action
+}
+
+// release drops a session's index entry: the client declared the session
+// finished, so its affinity should not linger until the TTL sweep.
+func (s *SessionCoverage) release(sid string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.sessions, sid)
 }
 
 // estimatePromptTokens estimates the request's prompt token count without
