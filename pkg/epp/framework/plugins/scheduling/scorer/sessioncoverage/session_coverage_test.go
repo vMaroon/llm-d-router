@@ -44,11 +44,21 @@ func (c *fakeClock) now() time.Time { return c.t }
 func (c *fakeClock) advance(d time.Duration) { c.t = c.t.Add(d) }
 
 func newTestScorer(params parameters) (*SessionCoverage, *fakeClock) {
+	if params.QueueWeight == 0 {
+		// Most tests pin the pure-affinity scoring mode; load-cost tests opt
+		// in with an explicit positive QueueWeight.
+		params.QueueWeight = -1
+	}
 	clock := &fakeClock{t: time.Unix(1_000_000, 0)}
 	//nolint:staticcheck // nil context intentionally skips the background sweeper in tests.
 	s := New(nil, "test", params)
 	s.now = clock.now
 	return s, clock
+}
+
+func withRequestID(r *fwksched.InferenceRequest, id string) *fwksched.InferenceRequest {
+	r.RequestID = id
+	return r
 }
 
 func newEndpoint(name string) fwksched.Endpoint {
@@ -428,6 +438,90 @@ func TestForkAdoptsParentCoverage(t *testing.T) {
 	expectScore(t, parentScores, podB, 0.0)
 }
 
+// costScenario builds a warm shared root on pod-a: the parent declared root R
+// (est 12001), completed, and left no in-flight work.
+func costScenario(t *testing.T) (*SessionCoverage, fwksched.Endpoint, fwksched.Endpoint) {
+	t.Helper()
+	s, _ := newTestScorer(parameters{QueueWeight: 1})
+	podA, podB := newEndpoint("pod-a"), newEndpoint("pod-b")
+	parent := withRequestID(withHeader(chatRequest("parent", 48000), defaultShareAsHeaderName, "R"), "req-parent")
+	s.PreRequest(context.Background(), parent, schedulingResultFor(podA))
+	s.ResponseBody(context.Background(), parent, endOfStreamResponse(12000, 20), podA.GetMetadata())
+	return s, podA, podB
+}
+
+func TestCostBurstSpillsFromWarmEndpoint(t *testing.T) {
+	s, podA, podB := costScenario(t)
+
+	// child-1 (est 12251, gap 250 on the warm pod) prefers pod-a and is
+	// scheduled there, leaving its work in flight.
+	child1 := withRequestID(withHeader(chatRequest("child-1", 49000), defaultRootHeaderName, "R"), "req-c1")
+	scores := s.Score(context.Background(), child1, []fwksched.Endpoint{podA, podB})
+	if scores[podA] <= scores[podB] {
+		t.Fatalf("idle warm pod must win: %v", scores)
+	}
+	s.PreRequest(context.Background(), child1, schedulingResultFor(podA))
+
+	// child-2 arrives while child-1 still occupies pod-a: queued work
+	// (12251) outweighs the prefill saving (250), so the cold pod wins.
+	child2 := withRequestID(withHeader(chatRequest("child-2", 49000), defaultRootHeaderName, "R"), "req-c2")
+	scores = s.Score(context.Background(), child2, []fwksched.Endpoint{podA, podB})
+	if scores[podB] <= scores[podA] {
+		t.Fatalf("burst must spill from the busy warm pod: %v", scores)
+	}
+}
+
+func TestCostStaggeredFollowsWarmEndpoint(t *testing.T) {
+	s, podA, podB := costScenario(t)
+
+	child1 := withRequestID(withHeader(chatRequest("child-1", 49000), defaultRootHeaderName, "R"), "req-c1")
+	s.PreRequest(context.Background(), child1, schedulingResultFor(podA))
+	// child-1 completes before child-2 arrives (staggered arrivals).
+	s.ResponseBody(context.Background(), child1, endOfStreamResponse(12250, 20), podA.GetMetadata())
+
+	child2 := withRequestID(withHeader(chatRequest("child-2", 49000), defaultRootHeaderName, "R"), "req-c2")
+	scores := s.Score(context.Background(), child2, []fwksched.Endpoint{podA, podB})
+	if scores[podA] <= scores[podB] {
+		t.Fatalf("staggered arrivals must follow the warm pod: %v", scores)
+	}
+}
+
+func TestCostNewSessionSpreadsByLoad(t *testing.T) {
+	s, _ := newTestScorer(parameters{QueueWeight: 1})
+	podA, podB := newEndpoint("pod-a"), newEndpoint("pod-b")
+
+	// Unrelated in-flight work occupies pod-a.
+	other := withRequestID(chatRequest("", 4000), "req-other")
+	s.PreRequest(context.Background(), other, schedulingResultFor(podA))
+
+	// A brand-new session has no coverage anywhere: least-loaded pod wins.
+	scores := s.Score(context.Background(), chatRequest("s-new", 4000), []fwksched.Endpoint{podA, podB})
+	if scores[podB] <= scores[podA] {
+		t.Fatalf("new session must prefer the less-loaded pod: %v", scores)
+	}
+
+	// Once the other request completes, the pods tie.
+	s.ResponseBody(context.Background(), other, endOfStreamResponse(1000, 20), podA.GetMetadata())
+	scores = s.Score(context.Background(), chatRequest("s-new", 4000), []fwksched.Endpoint{podA, podB})
+	expectScore(t, scores, podA, 0.5)
+	expectScore(t, scores, podB, 0.5)
+}
+
+func TestInFlightOrphansExpire(t *testing.T) {
+	s, clock := newTestScorer(parameters{QueueWeight: 1})
+	podA, podB := newEndpoint("pod-a"), newEndpoint("pod-b")
+
+	orphan := withRequestID(chatRequest("", 4000), "req-orphan")
+	s.PreRequest(context.Background(), orphan, schedulingResultFor(podA))
+
+	clock.advance(inFlightTTL + time.Minute)
+	s.removeExpired()
+
+	scores := s.Score(context.Background(), chatRequest("s-new", 4000), []fwksched.Endpoint{podA, podB})
+	expectScore(t, scores, podA, 0.5)
+	expectScore(t, scores, podB, 0.5)
+}
+
 func TestFactoryDefaults(t *testing.T) {
 	p, err := Factory("session-coverage", nil, nil)
 	if err != nil {
@@ -438,7 +532,8 @@ func TestFactoryDefaults(t *testing.T) {
 		t.Fatalf("Factory returned %T, want *SessionCoverage", p)
 	}
 	if s.headerName != defaultHeaderName || s.charsPerToken != defaultCharsPerToken ||
-		s.sessionTTL != defaultSessionTTL || s.maxSessions != defaultMaxSessions {
+		s.sessionTTL != defaultSessionTTL || s.maxSessions != defaultMaxSessions ||
+		s.queueWeight != defaultQueueWeight {
 		t.Errorf("Factory defaults not applied: %+v", s)
 	}
 	if s.TypedName().Type != SessionCoverageScorerType {

@@ -65,6 +65,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 	"time"
@@ -91,6 +92,11 @@ const (
 	defaultSessionTTL        = 30 * time.Minute
 	defaultMaxSessions       = 100_000
 	defaultRolloverRatio     = 0.5
+	defaultQueueWeight       = 1.0
+
+	// inFlightTTL bounds how long an in-flight accounting entry may live
+	// without its response arriving (crashed streams, dropped clients).
+	inFlightTTL = 15 * time.Minute
 
 	// rootKeyPrefix namespaces shared-root entries within the session index.
 	rootKeyPrefix = "root:"
@@ -130,6 +136,14 @@ type parameters struct {
 	// falls below this fraction of the session's best-known coverage.
 	// Defaults to 0.5 when unset; a negative value disables rollover detection.
 	RolloverRatio float64 `json:"rolloverRatio"`
+	// QueueWeight blends endpoint load into the placement cost, in token
+	// units per estimated in-flight token: cost_e = gap_e + QueueWeight *
+	// inflight_e, making placement a continuum between longest-prefix-match
+	// (0) and least-loaded (large). In-flight work is tracked inside the
+	// plugin from PreRequest/ResponseBody, so it is fresh under bursts where
+	// scraped metrics lag. Defaults to 1.0; a negative value disables the
+	// load term and scores pure coverage fraction.
+	QueueWeight float64 `json:"queueWeight"`
 }
 
 // compile-time type assertions
@@ -191,6 +205,13 @@ func New(ctx context.Context, name string, params parameters) *SessionCoverage {
 	if rolloverRatio == 0 {
 		rolloverRatio = defaultRolloverRatio
 	}
+	queueWeight := params.QueueWeight
+	if queueWeight == 0 {
+		queueWeight = defaultQueueWeight
+	}
+	if queueWeight < 0 {
+		queueWeight = 0
+	}
 
 	s := &SessionCoverage{
 		typedName:     plugin.TypedName{Type: SessionCoverageScorerType, Name: name},
@@ -202,8 +223,11 @@ func New(ctx context.Context, name string, params parameters) *SessionCoverage {
 		sessionTTL:    sessionTTL,
 		maxSessions:   maxSessions,
 		rolloverRatio: rolloverRatio,
+		queueWeight:   queueWeight,
 		now:           time.Now,
 		sessions:      map[string]*sessionEntry{},
+		inFlight:      map[string]*inFlightEntry{},
+		podLoad:       map[string]int64{},
 	}
 	if ctx != nil {
 		go s.sweep(ctx)
@@ -224,10 +248,25 @@ type SessionCoverage struct {
 	maxSessions   int
 	rolloverRatio float64
 
+	queueWeight float64
+
 	now func() time.Time
 
 	mu       sync.Mutex
 	sessions map[string]*sessionEntry
+	// inFlight tracks scheduled-but-unfinished requests by request id;
+	// podLoad aggregates their estimated tokens per endpoint. Maintained from
+	// PreRequest/ResponseBody so it is fresh under bursts, unlike scraped
+	// metrics.
+	inFlight map[string]*inFlightEntry
+	podLoad  map[string]int64
+}
+
+// inFlightEntry accounts one scheduled request's estimated work.
+type inFlightEntry struct {
+	pod     string
+	tokens  int64
+	started time.Time
 }
 
 // sessionEntry tracks one session's per-endpoint coverage high-water marks.
@@ -274,21 +313,102 @@ func (s *SessionCoverage) Score(ctx context.Context, request *fwksched.Inference
 	}
 
 	coverage := s.effectiveCoverage(ctx, sid, rootID, s.headerValue(request, s.forkHeader), x)
-	if coverage == nil {
+
+	if s.queueWeight <= 0 {
+		// Pure affinity: covered fraction of the prompt, load left to other
+		// scorers in the profile.
+		if coverage == nil {
+			return scores
+		}
+		for _, endpoint := range endpoints {
+			c := coverage[endpoint.GetMetadata().NamespacedName.String()]
+			if c <= 0 {
+				continue
+			}
+			if c > x {
+				c = x
+			}
+			scores[endpoint] = float64(c) / float64(x)
+		}
 		return scores
 	}
 
+	// Placement cost (spec continuum between longest-prefix-match and
+	// least-loaded): cost_e = gap_e + queueWeight * inflight_e, all in
+	// estimated-token units. A warm endpoint loses its edge once the work
+	// queued on it outweighs the prefill it saves; with no coverage anywhere
+	// this degrades to least-estimated-load placement.
+	load := s.podLoadSnapshot()
+	costs := make(map[fwksched.Endpoint]float64, len(endpoints))
+	minCost, maxCost := math.Inf(1), math.Inf(-1)
 	for _, endpoint := range endpoints {
-		c := coverage[endpoint.GetMetadata().NamespacedName.String()]
-		if c <= 0 {
-			continue
+		key := endpoint.GetMetadata().NamespacedName.String()
+		var c int64
+		if coverage != nil {
+			c = coverage[key]
+			if c > x {
+				c = x
+			}
 		}
-		if c > x {
-			c = x
+		cost := float64(x-c) + s.queueWeight*float64(load[key])
+		costs[endpoint] = cost
+		minCost = math.Min(minCost, cost)
+		maxCost = math.Max(maxCost, cost)
+	}
+	for endpoint, cost := range costs {
+		if maxCost > minCost {
+			scores[endpoint] = (maxCost - cost) / (maxCost - minCost)
+		} else {
+			scores[endpoint] = 0.5
 		}
-		scores[endpoint] = float64(c) / float64(x)
 	}
 	return scores
+}
+
+// podLoadSnapshot returns a copy of the per-endpoint in-flight token counts.
+func (s *SessionCoverage) podLoadSnapshot() map[string]int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	load := make(map[string]int64, len(s.podLoad))
+	for pod, tokens := range s.podLoad {
+		load[pod] = tokens
+	}
+	return load
+}
+
+// trackInFlight records a scheduled request's estimated work on its endpoint.
+// A re-track of the same request id (retry, reschedule) moves the work.
+func (s *SessionCoverage) trackInFlight(requestID, pod string, tokens int64) {
+	now := s.now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if prev, ok := s.inFlight[requestID]; ok {
+		s.decrementLoadLocked(prev)
+	}
+	s.inFlight[requestID] = &inFlightEntry{pod: pod, tokens: tokens, started: now}
+	s.podLoad[pod] += tokens
+}
+
+// releaseInFlight settles a request's in-flight accounting.
+func (s *SessionCoverage) releaseInFlight(requestID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entry, ok := s.inFlight[requestID]
+	if !ok {
+		return
+	}
+	delete(s.inFlight, requestID)
+	s.decrementLoadLocked(entry)
+}
+
+// decrementLoadLocked removes an entry's tokens from its endpoint's load.
+// Callers must hold s.mu.
+func (s *SessionCoverage) decrementLoadLocked(entry *inFlightEntry) {
+	if remaining := s.podLoad[entry.pod] - entry.tokens; remaining > 0 {
+		s.podLoad[entry.pod] = remaining
+	} else {
+		delete(s.podLoad, entry.pod)
+	}
 }
 
 // effectiveCoverage returns a merged copy of the coverage visible to this
@@ -371,17 +491,22 @@ func (s *SessionCoverage) ownEntryLocked(sid, forkFrom string) *sessionEntry {
 // request's estimated prompt tokens, so the placement is visible to the next
 // request of the session before the response completes.
 func (s *SessionCoverage) PreRequest(ctx context.Context, request *fwksched.InferenceRequest, schedulingResult *fwksched.SchedulingResult) {
-	sid := s.sessionID(request)
-	shareAs := s.headerValue(request, s.shareAsHeader)
-	if sid == "" && shareAs == "" {
-		return
-	}
 	pod := primaryTargetPod(schedulingResult)
 	if pod == "" {
 		return
 	}
 	x := s.estimatePromptTokens(request)
 	if x <= 0 {
+		return
+	}
+	// Load accounting covers every scheduled request, session-tagged or not,
+	// so the cost term sees the endpoint's full in-flight picture.
+	if s.queueWeight > 0 && request.RequestID != "" {
+		s.trackInFlight(request.RequestID, pod, x)
+	}
+	sid := s.sessionID(request)
+	shareAs := s.headerValue(request, s.shareAsHeader)
+	if sid == "" && shareAs == "" {
 		return
 	}
 	if sid != "" {
@@ -400,7 +525,13 @@ func (s *SessionCoverage) PreRequest(ctx context.Context, request *fwksched.Infe
 // one; responses without usage (e.g. streams without include_usage) leave the
 // PreRequest estimate in place.
 func (s *SessionCoverage) ResponseBody(ctx context.Context, request *fwksched.InferenceRequest, response *requestcontrol.Response, targetEndpoint *datalayer.EndpointMetadata) {
-	if response == nil || !response.EndOfStream || targetEndpoint == nil {
+	if response == nil || !response.EndOfStream {
+		return
+	}
+	if request != nil && request.RequestID != "" {
+		s.releaseInFlight(request.RequestID)
+	}
+	if targetEndpoint == nil {
 		return
 	}
 	sid := s.sessionID(request)
@@ -507,12 +638,22 @@ func (s *SessionCoverage) sweep(ctx context.Context) {
 }
 
 func (s *SessionCoverage) removeExpired() {
-	cutoff := s.now().Add(-s.sessionTTL)
+	now := s.now()
+	cutoff := now.Add(-s.sessionTTL)
+	inFlightCutoff := now.Add(-inFlightTTL)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for sid, entry := range s.sessions {
 		if entry.lastSeen.Before(cutoff) {
 			delete(s.sessions, sid)
+		}
+	}
+	// Requests whose response never arrived (crashed streams, dropped
+	// clients) must not pin phantom load on an endpoint forever.
+	for requestID, entry := range s.inFlight {
+		if entry.started.Before(inFlightCutoff) {
+			delete(s.inFlight, requestID)
+			s.decrementLoadLocked(entry)
 		}
 	}
 }
