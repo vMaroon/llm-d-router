@@ -350,6 +350,84 @@ func TestEstimatePromptTokens(t *testing.T) {
 	}
 }
 
+func withHeader(r *fwksched.InferenceRequest, name, value string) *fwksched.InferenceRequest {
+	r.Headers[name] = value
+	return r
+}
+
+func TestRootSharingAcrossSessions(t *testing.T) {
+	s, _ := newTestScorer(parameters{})
+	podA, podB := newEndpoint("pod-a"), newEndpoint("pod-b")
+
+	// Parent declares its prompt as root R and lands on pod-a.
+	parent := withHeader(chatRequest("parent", 48000), defaultShareAsHeaderName, "R")
+	s.PreRequest(context.Background(), parent, schedulingResultFor(podA))
+	s.ResponseBody(context.Background(), parent, endOfStreamResponse(12000, 50), podA.GetMetadata())
+
+	// A fresh session referencing R sees pod-a warm (full coverage of its
+	// prompt, clamped), pod-b cold.
+	child1 := withHeader(chatRequest("child-1", 47000), defaultRootHeaderName, "R")
+	scores := s.Score(context.Background(), child1, []fwksched.Endpoint{podA, podB})
+	expectScore(t, scores, podA, 1.0)
+	expectScore(t, scores, podB, 0.0)
+
+	// child-1 gets served on pod-b; its response warms the root there too
+	// (the root prefix is now resident on both endpoints — reuse is a forest).
+	s.ResponseBody(context.Background(), child1, endOfStreamResponse(12150, 40), podB.GetMetadata())
+	child2 := withHeader(chatRequest("child-2", 47000), defaultRootHeaderName, "R")
+	scores = s.Score(context.Background(), child2, []fwksched.Endpoint{podA, podB})
+	expectScore(t, scores, podA, 1.0)
+	expectScore(t, scores, podB, 1.0)
+}
+
+func TestRootReferenceToUnknownRootScoresZero(t *testing.T) {
+	s, _ := newTestScorer(parameters{})
+	podA := newEndpoint("pod-a")
+
+	child := withHeader(chatRequest("child", 4000), defaultRootHeaderName, "nope")
+	scores := s.Score(context.Background(), child, []fwksched.Endpoint{podA})
+	expectScore(t, scores, podA, 0.0)
+}
+
+func TestChildrenDoNotWarmRootAtScheduling(t *testing.T) {
+	s, _ := newTestScorer(parameters{})
+	podA, podC := newEndpoint("pod-a"), newEndpoint("pod-c")
+
+	parent := withHeader(chatRequest("parent", 48000), defaultShareAsHeaderName, "R")
+	s.PreRequest(context.Background(), parent, schedulingResultFor(podA))
+
+	// A child scheduled to pod-c must NOT mark the root warm there before its
+	// response exists — optimistic root warmth would herd a burst.
+	child := withHeader(chatRequest("child-1", 47000), defaultRootHeaderName, "R")
+	s.PreRequest(context.Background(), child, schedulingResultFor(podC))
+
+	probe := withHeader(chatRequest("child-2", 47000), defaultRootHeaderName, "R")
+	scores := s.Score(context.Background(), probe, []fwksched.Endpoint{podA, podC})
+	expectScore(t, scores, podA, 1.0) // parent's own optimistic placement
+	expectScore(t, scores, podC, 0.0) // child scheduling left no trace
+}
+
+func TestForkAdoptsParentCoverage(t *testing.T) {
+	s, _ := newTestScorer(parameters{})
+	podA, podB := newEndpoint("pod-a"), newEndpoint("pod-b")
+
+	parent := chatRequest("parent", 4000)
+	s.PreRequest(context.Background(), parent, schedulingResultFor(podA))
+	s.ResponseBody(context.Background(), parent, endOfStreamResponse(1200, 100), podA.GetMetadata())
+
+	// First sight of the fork: adopts the parent's coverage.
+	fork := withHeader(chatRequest("fork-1", 4400), defaultForkHeaderName, "parent")
+	scores := s.Score(context.Background(), fork, []fwksched.Endpoint{podA, podB})
+	if scores[podA] <= 0 {
+		t.Fatalf("fork should score the parent's endpoint, got %v", scores[podA])
+	}
+
+	// The fork then diverges on pod-b without touching the parent.
+	s.ResponseBody(context.Background(), fork, endOfStreamResponse(2000, 100), podB.GetMetadata())
+	parentScores := s.Score(context.Background(), chatRequest("parent", 4000), []fwksched.Endpoint{podA, podB})
+	expectScore(t, parentScores, podB, 0.0)
+}
+
 func TestFactoryDefaults(t *testing.T) {
 	p, err := Factory("session-coverage", nil, nil)
 	if err != nil {

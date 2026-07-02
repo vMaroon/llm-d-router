@@ -41,6 +41,24 @@ limitations under the License.
 // request's estimated prompt shrinks well below the session's best-known
 // coverage the prefix was rewritten (e.g. history compaction); the entry is
 // reset and the session re-places fresh ("rollover" detection).
+//
+// Cross-session KV sharing (reuse is a forest, not per-session silos):
+//
+//   - share_as: a request may declare its prompt as a shared root. The root
+//     gets its own index entry; its coverage is fed from responses.
+//   - root reference: a request may declare that its prompt extends a shared
+//     root. Scoring takes the best of the session's own coverage and the
+//     root's coverage, and the serving endpoint's root coverage is raised
+//     from the response — every endpoint that ever served a child holds the
+//     root prefix, so later children spread across warm endpoints.
+//   - fork: a new session may declare it forks from a parent session; it
+//     adopts the parent's coverage on first sight and diverges from there.
+//
+// Children referencing a root never bump the root's coverage at scheduling
+// time: during a burst that would mark endpoints warm before the KV exists
+// and herd the whole burst onto the first pick. Only the declaring (share_as)
+// request records its placement optimistically; all other root warmth comes
+// from responses, and load scorers spread the cold remainder.
 package sessioncoverage
 
 import (
@@ -65,11 +83,17 @@ const (
 	// SessionCoverageScorerType is the type of the SessionCoverage scorer.
 	SessionCoverageScorerType = "session-coverage-scorer"
 
-	defaultHeaderName    = "x-session-id"
-	defaultCharsPerToken = 4.0
-	defaultSessionTTL    = 30 * time.Minute
-	defaultMaxSessions   = 100_000
-	defaultRolloverRatio = 0.5
+	defaultHeaderName        = "x-session-id"
+	defaultRootHeaderName    = "x-root-id"
+	defaultShareAsHeaderName = "x-share-as"
+	defaultForkHeaderName    = "x-fork-from"
+	defaultCharsPerToken     = 4.0
+	defaultSessionTTL        = 30 * time.Minute
+	defaultMaxSessions       = 100_000
+	defaultRolloverRatio     = 0.5
+
+	// rootKeyPrefix namespaces shared-root entries within the session index.
+	rootKeyPrefix = "root:"
 
 	// sweepInterval is how often expired sessions are removed in the background.
 	sweepInterval = time.Minute
@@ -84,6 +108,16 @@ type parameters struct {
 	// x-session-id. When the session-id-producer is configured its attribute
 	// takes precedence over the header.
 	HeaderName string `json:"headerName"`
+	// RootHeaderName is the request header declaring that this request's
+	// prompt extends a shared root. Defaults to x-root-id.
+	RootHeaderName string `json:"rootHeaderName"`
+	// ShareAsHeaderName is the request header declaring this request's prompt
+	// as a shared root under the given id. Defaults to x-share-as.
+	ShareAsHeaderName string `json:"shareAsHeaderName"`
+	// ForkHeaderName is the request header declaring that this session forks
+	// from the given parent session, adopting its coverage on first sight.
+	// Defaults to x-fork-from.
+	ForkHeaderName string `json:"forkHeaderName"`
 	// CharsPerToken is the characters-per-token ratio used to estimate prompt
 	// tokens when no tokenized prompt is available. Defaults to 4.0.
 	CharsPerToken float64 `json:"charsPerToken"`
@@ -129,6 +163,18 @@ func New(ctx context.Context, name string, params parameters) *SessionCoverage {
 	if headerName == "" {
 		headerName = defaultHeaderName
 	}
+	rootHeader := strings.ToLower(strings.TrimSpace(params.RootHeaderName))
+	if rootHeader == "" {
+		rootHeader = defaultRootHeaderName
+	}
+	shareAsHeader := strings.ToLower(strings.TrimSpace(params.ShareAsHeaderName))
+	if shareAsHeader == "" {
+		shareAsHeader = defaultShareAsHeaderName
+	}
+	forkHeader := strings.ToLower(strings.TrimSpace(params.ForkHeaderName))
+	if forkHeader == "" {
+		forkHeader = defaultForkHeaderName
+	}
 	charsPerToken := params.CharsPerToken
 	if charsPerToken <= 0 {
 		charsPerToken = defaultCharsPerToken
@@ -149,6 +195,9 @@ func New(ctx context.Context, name string, params parameters) *SessionCoverage {
 	s := &SessionCoverage{
 		typedName:     plugin.TypedName{Type: SessionCoverageScorerType, Name: name},
 		headerName:    headerName,
+		rootHeader:    rootHeader,
+		shareAsHeader: shareAsHeader,
+		forkHeader:    forkHeader,
 		charsPerToken: charsPerToken,
 		sessionTTL:    sessionTTL,
 		maxSessions:   maxSessions,
@@ -167,6 +216,9 @@ func New(ctx context.Context, name string, params parameters) *SessionCoverage {
 type SessionCoverage struct {
 	typedName     plugin.TypedName
 	headerName    string
+	rootHeader    string
+	shareAsHeader string
+	forkHeader    string
 	charsPerToken float64
 	sessionTTL    time.Duration
 	maxSessions   int
@@ -212,7 +264,8 @@ func (s *SessionCoverage) Score(ctx context.Context, request *fwksched.Inference
 	}
 
 	sid := s.sessionID(request)
-	if sid == "" {
+	rootID := s.headerValue(request, s.rootHeader)
+	if sid == "" && rootID == "" {
 		return scores
 	}
 	x := s.estimatePromptTokens(request)
@@ -220,7 +273,7 @@ func (s *SessionCoverage) Score(ctx context.Context, request *fwksched.Inference
 		return scores
 	}
 
-	coverage := s.coverageFor(ctx, sid, x)
+	coverage := s.effectiveCoverage(ctx, sid, rootID, s.headerValue(request, s.forkHeader), x)
 	if coverage == nil {
 		return scores
 	}
@@ -238,36 +291,80 @@ func (s *SessionCoverage) Score(ctx context.Context, request *fwksched.Inference
 	return scores
 }
 
-// coverageFor returns a copy of the session's coverage map, handling rollover
-// detection and last-seen accounting. It returns nil for unknown sessions and
-// for sessions just reset by rollover.
-func (s *SessionCoverage) coverageFor(ctx context.Context, sid string, promptTokens int64) map[string]int64 {
+// effectiveCoverage returns a merged copy of the coverage visible to this
+// request: the session's own coverage (after fork adoption and rollover
+// handling) overlaid with the referenced shared root's coverage, taking the
+// per-endpoint maximum. It returns nil when neither source is known.
+func (s *SessionCoverage) effectiveCoverage(ctx context.Context, sid, rootID, forkFrom string, promptTokens int64) map[string]int64 {
+	now := s.now()
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	entry, ok := s.sessions[sid]
-	if !ok {
-		return nil
-	}
+	var coverage map[string]int64
 
-	if s.rolloverRatio > 0 {
-		if best := entry.maxPromptEst; best > 0 && float64(promptTokens) < s.rolloverRatio*float64(best) {
-			// The prompt shrank well below the session's known prefix: the
-			// history was rewritten (e.g. compaction). The old KV no longer
-			// prefix-matches, so drop the entry and let the session re-place.
-			delete(s.sessions, sid)
-			log.FromContext(ctx).V(logutil.DEFAULT).Info("session rollover detected, index entry reset",
-				"scorer", s.typedName.String(), "session", sid, "promptEstimate", promptTokens, "bestPromptEstimate", best)
-			return nil
+	if sid != "" {
+		entry := s.ownEntryLocked(sid, forkFrom)
+		if entry != nil && s.rolloverRatio > 0 {
+			if best := entry.maxPromptEst; best > 0 && float64(promptTokens) < s.rolloverRatio*float64(best) {
+				// The prompt shrank well below the session's known prefix: the
+				// history was rewritten (e.g. compaction). The old KV no longer
+				// prefix-matches, so drop the entry and let the session re-place.
+				delete(s.sessions, sid)
+				log.FromContext(ctx).V(logutil.DEFAULT).Info("session rollover detected, index entry reset",
+					"scorer", s.typedName.String(), "session", sid, "promptEstimate", promptTokens, "bestPromptEstimate", best)
+				entry = nil
+			}
+		}
+		if entry != nil {
+			entry.lastSeen = now
+			coverage = make(map[string]int64, len(entry.coverage))
+			for pod, c := range entry.coverage {
+				coverage[pod] = c
+			}
 		}
 	}
 
-	entry.lastSeen = s.now()
-	coverage := make(map[string]int64, len(entry.coverage))
-	for pod, c := range entry.coverage {
-		coverage[pod] = c
+	if rootID != "" {
+		if root, ok := s.sessions[rootKeyPrefix+rootID]; ok {
+			root.lastSeen = now
+			if coverage == nil {
+				coverage = make(map[string]int64, len(root.coverage))
+			}
+			for pod, c := range root.coverage {
+				if c > coverage[pod] {
+					coverage[pod] = c
+				}
+			}
+		}
 	}
+
 	return coverage
+}
+
+// ownEntryLocked returns the session's entry, creating it by fork adoption
+// when the session is unknown but names a known parent. Callers must hold
+// s.mu.
+func (s *SessionCoverage) ownEntryLocked(sid, forkFrom string) *sessionEntry {
+	if entry, ok := s.sessions[sid]; ok {
+		return entry
+	}
+	if forkFrom == "" {
+		return nil
+	}
+	parent, ok := s.sessions[forkFrom]
+	if !ok {
+		return nil
+	}
+	entry := &sessionEntry{
+		coverage:     make(map[string]int64, len(parent.coverage)),
+		maxPromptEst: parent.maxPromptEst,
+	}
+	for pod, c := range parent.coverage {
+		entry.coverage[pod] = c
+	}
+	s.sessions[sid] = entry
+	return entry
 }
 
 // PreRequest optimistically raises the scheduled endpoint's coverage to the
@@ -275,7 +372,8 @@ func (s *SessionCoverage) coverageFor(ctx context.Context, sid string, promptTok
 // request of the session before the response completes.
 func (s *SessionCoverage) PreRequest(ctx context.Context, request *fwksched.InferenceRequest, schedulingResult *fwksched.SchedulingResult) {
 	sid := s.sessionID(request)
-	if sid == "" {
+	shareAs := s.headerValue(request, s.shareAsHeader)
+	if sid == "" && shareAs == "" {
 		return
 	}
 	pod := primaryTargetPod(schedulingResult)
@@ -286,7 +384,15 @@ func (s *SessionCoverage) PreRequest(ctx context.Context, request *fwksched.Infe
 	if x <= 0 {
 		return
 	}
-	s.bump(ctx, sid, pod, x, x)
+	if sid != "" {
+		s.bump(ctx, sid, pod, x, x, s.headerValue(request, s.forkHeader))
+	}
+	if shareAs != "" {
+		// The declaring request's placement is where the root will live; an
+		// immediately-following fan-out must see it. The parent's response
+		// corrects the value to real usage.
+		s.bump(ctx, rootKeyPrefix+shareAs, pod, x, 0, "")
+	}
 }
 
 // ResponseBody raises the serving endpoint's coverage to the token usage
@@ -298,7 +404,9 @@ func (s *SessionCoverage) ResponseBody(ctx context.Context, request *fwksched.In
 		return
 	}
 	sid := s.sessionID(request)
-	if sid == "" {
+	shareAs := s.headerValue(request, s.shareAsHeader)
+	rootID := s.headerValue(request, s.rootHeader)
+	if sid == "" && shareAs == "" && rootID == "" {
 		return
 	}
 	total := int64(response.Usage.PromptTokens) + int64(response.Usage.CompletionTokens)
@@ -306,7 +414,20 @@ func (s *SessionCoverage) ResponseBody(ctx context.Context, request *fwksched.In
 		return
 	}
 	pod := targetEndpoint.NamespacedName.String()
-	s.bump(ctx, sid, pod, total, 0)
+	if sid != "" {
+		s.bump(ctx, sid, pod, total, 0, s.headerValue(request, s.forkHeader))
+	}
+	// Roots grow by served prompts only: completions belong to the requester,
+	// not the shared prefix. A child's prompt extends past the root by its
+	// own suffix; the overshoot is bounded and clamped at scoring time.
+	if prompt := int64(response.Usage.PromptTokens); prompt > 0 {
+		if shareAs != "" {
+			s.bump(ctx, rootKeyPrefix+shareAs, pod, prompt, 0, "")
+		}
+		if rootID != "" {
+			s.bump(ctx, rootKeyPrefix+rootID, pod, prompt, 0, "")
+		}
+	}
 
 	if logger := log.FromContext(ctx); logger.V(logutil.TRACE).Enabled() {
 		cached := 0
@@ -322,15 +443,16 @@ func (s *SessionCoverage) ResponseBody(ctx context.Context, request *fwksched.In
 
 // bump raises the session's coverage high-water mark on the given endpoint
 // and, when promptEst > 0, the session's prompt-estimate high-water mark.
-// Both are monotone; stale smaller values never overwrite.
-func (s *SessionCoverage) bump(ctx context.Context, sid, pod string, tokens, promptEst int64) {
+// Both are monotone; stale smaller values never overwrite. A yet-unknown
+// session naming a known fork parent adopts the parent's coverage first.
+func (s *SessionCoverage) bump(ctx context.Context, sid, pod string, tokens, promptEst int64, forkFrom string) {
 	now := s.now()
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	entry, ok := s.sessions[sid]
-	if !ok {
+	entry := s.ownEntryLocked(sid, forkFrom)
+	if entry == nil {
 		if len(s.sessions) >= s.maxSessions {
 			s.evictLocked(ctx, now)
 		}
@@ -393,6 +515,14 @@ func (s *SessionCoverage) removeExpired() {
 			delete(s.sessions, sid)
 		}
 	}
+}
+
+// headerValue returns the trimmed value of the named request header.
+func (s *SessionCoverage) headerValue(request *fwksched.InferenceRequest, name string) string {
+	if request == nil || request.Headers == nil || name == "" {
+		return ""
+	}
+	return strings.TrimSpace(request.Headers[name])
 }
 
 // sessionID resolves the request's session id: the session-id-producer
