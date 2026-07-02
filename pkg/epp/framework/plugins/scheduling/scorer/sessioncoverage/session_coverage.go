@@ -93,6 +93,7 @@ const (
 	defaultMaxSessions       = 100_000
 	defaultRolloverRatio     = 0.5
 	defaultQueueWeight       = 1.0
+	defaultDecodeAllowance   = 750.0
 
 	// inFlightTTL bounds how long an in-flight accounting entry may live
 	// without its response arriving (crashed streams, dropped clients).
@@ -136,14 +137,20 @@ type parameters struct {
 	// falls below this fraction of the session's best-known coverage.
 	// Defaults to 0.5 when unset; a negative value disables rollover detection.
 	RolloverRatio float64 `json:"rolloverRatio"`
-	// QueueWeight blends endpoint load into the placement cost, in token
-	// units per estimated in-flight token: cost_e = gap_e + QueueWeight *
-	// inflight_e, making placement a continuum between longest-prefix-match
-	// (0) and least-loaded (large). In-flight work is tracked inside the
-	// plugin from PreRequest/ResponseBody, so it is fresh under bursts where
-	// scraped metrics lag. Defaults to 1.0; a negative value disables the
-	// load term and scores pure coverage fraction.
+	// QueueWeight blends endpoint load into the placement cost:
+	// cost_e = gap_e + QueueWeight * inflight_e, making placement a continuum
+	// between longest-prefix-match (0) and least-loaded (large). In-flight
+	// work is tracked inside the plugin from PreRequest/ResponseBody, so it
+	// is fresh under bursts where scraped metrics lag. Defaults to 1.0; a
+	// negative value disables the load term and scores pure coverage
+	// fraction.
 	QueueWeight float64 `json:"queueWeight"`
+	// DecodeAllowanceTokens prices a resident request's decode phase, in
+	// estimated-token units added to its remaining prefill gap when
+	// accounting in-flight work. Decode tokens are far slower than prefill
+	// tokens (measured ~17x on H200/32B), so 100 output tokens occupy about
+	// 700-800 estimate units. Defaults to 750.
+	DecodeAllowanceTokens float64 `json:"decodeAllowanceTokens"`
 }
 
 // compile-time type assertions
@@ -212,22 +219,30 @@ func New(ctx context.Context, name string, params parameters) *SessionCoverage {
 	if queueWeight < 0 {
 		queueWeight = 0
 	}
+	decodeAllowance := params.DecodeAllowanceTokens
+	if decodeAllowance == 0 {
+		decodeAllowance = defaultDecodeAllowance
+	}
+	if decodeAllowance < 0 {
+		decodeAllowance = 0
+	}
 
 	s := &SessionCoverage{
-		typedName:     plugin.TypedName{Type: SessionCoverageScorerType, Name: name},
-		headerName:    headerName,
-		rootHeader:    rootHeader,
-		shareAsHeader: shareAsHeader,
-		forkHeader:    forkHeader,
-		charsPerToken: charsPerToken,
-		sessionTTL:    sessionTTL,
-		maxSessions:   maxSessions,
-		rolloverRatio: rolloverRatio,
-		queueWeight:   queueWeight,
-		now:           time.Now,
-		sessions:      map[string]*sessionEntry{},
-		inFlight:      map[string]*inFlightEntry{},
-		podLoad:       map[string]int64{},
+		typedName:       plugin.TypedName{Type: SessionCoverageScorerType, Name: name},
+		headerName:      headerName,
+		rootHeader:      rootHeader,
+		shareAsHeader:   shareAsHeader,
+		forkHeader:      forkHeader,
+		charsPerToken:   charsPerToken,
+		sessionTTL:      sessionTTL,
+		maxSessions:     maxSessions,
+		rolloverRatio:   rolloverRatio,
+		queueWeight:     queueWeight,
+		decodeAllowance: decodeAllowance,
+		now:             time.Now,
+		sessions:        map[string]*sessionEntry{},
+		inFlight:        map[string]*inFlightEntry{},
+		podLoad:         map[string]int64{},
 	}
 	if ctx != nil {
 		go s.sweep(ctx)
@@ -248,7 +263,8 @@ type SessionCoverage struct {
 	maxSessions   int
 	rolloverRatio float64
 
-	queueWeight float64
+	queueWeight     float64
+	decodeAllowance float64
 
 	now func() time.Time
 
@@ -262,10 +278,11 @@ type SessionCoverage struct {
 	podLoad  map[string]int64
 }
 
-// inFlightEntry accounts one scheduled request's estimated work.
+// inFlightEntry accounts one scheduled request's estimated work: the prefill
+// gap it was admitted with plus the decode allowance.
 type inFlightEntry struct {
 	pod     string
-	tokens  int64
+	work    int64
 	started time.Time
 }
 
@@ -378,15 +395,15 @@ func (s *SessionCoverage) podLoadSnapshot() map[string]int64 {
 
 // trackInFlight records a scheduled request's estimated work on its endpoint.
 // A re-track of the same request id (retry, reschedule) moves the work.
-func (s *SessionCoverage) trackInFlight(requestID, pod string, tokens int64) {
+func (s *SessionCoverage) trackInFlight(requestID, pod string, work int64) {
 	now := s.now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if prev, ok := s.inFlight[requestID]; ok {
 		s.decrementLoadLocked(prev)
 	}
-	s.inFlight[requestID] = &inFlightEntry{pod: pod, tokens: tokens, started: now}
-	s.podLoad[pod] += tokens
+	s.inFlight[requestID] = &inFlightEntry{pod: pod, work: work, started: now}
+	s.podLoad[pod] += work
 }
 
 // releaseInFlight settles a request's in-flight accounting.
@@ -404,7 +421,7 @@ func (s *SessionCoverage) releaseInFlight(requestID string) {
 // decrementLoadLocked removes an entry's tokens from its endpoint's load.
 // Callers must hold s.mu.
 func (s *SessionCoverage) decrementLoadLocked(entry *inFlightEntry) {
-	if remaining := s.podLoad[entry.pod] - entry.tokens; remaining > 0 {
+	if remaining := s.podLoad[entry.pod] - entry.work; remaining > 0 {
 		s.podLoad[entry.pod] = remaining
 	} else {
 		delete(s.podLoad, entry.pod)
@@ -499,13 +516,23 @@ func (s *SessionCoverage) PreRequest(ctx context.Context, request *fwksched.Infe
 	if x <= 0 {
 		return
 	}
-	// Load accounting covers every scheduled request, session-tagged or not,
-	// so the cost term sees the endpoint's full in-flight picture.
-	if s.queueWeight > 0 && request.RequestID != "" {
-		s.trackInFlight(request.RequestID, pod, x)
-	}
 	sid := s.sessionID(request)
 	shareAs := s.headerValue(request, s.shareAsHeader)
+	// Load accounting covers every scheduled request, session-tagged or not,
+	// so the cost term sees the endpoint's full in-flight picture. A request
+	// occupies its admission-time prefill gap plus the decode allowance —
+	// covered prefixes queue no prefill work.
+	if s.queueWeight > 0 && request.RequestID != "" {
+		gap := x
+		coverage := s.effectiveCoverage(ctx, sid, s.headerValue(request, s.rootHeader), s.headerValue(request, s.forkHeader), x)
+		if c := coverage[pod]; c > 0 {
+			if c > x {
+				c = x
+			}
+			gap = x - c
+		}
+		s.trackInFlight(request.RequestID, pod, gap+int64(s.decodeAllowance))
+	}
 	if sid == "" && shareAs == "" {
 		return
 	}

@@ -18,6 +18,7 @@ package sessioncoverage
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"strings"
 	"testing"
@@ -453,21 +454,24 @@ func costScenario(t *testing.T) (*SessionCoverage, fwksched.Endpoint, fwksched.E
 func TestCostBurstSpillsFromWarmEndpoint(t *testing.T) {
 	s, podA, podB := costScenario(t)
 
-	// child-1 (est 12251, gap 250 on the warm pod) prefers pod-a and is
-	// scheduled there, leaving its work in flight.
-	child1 := withRequestID(withHeader(chatRequest("child-1", 49000), defaultRootHeaderName, "R"), "req-c1")
-	scores := s.Score(context.Background(), child1, []fwksched.Endpoint{podA, podB})
-	if scores[podA] <= scores[podB] {
-		t.Fatalf("idle warm pod must win: %v", scores)
+	// Each stacked child occupies its admission gap (250) plus the decode
+	// allowance (750). A lightly-stacked warm pod keeps winning — reuse is
+	// worth more than the queue — until the stacked work outweighs a cold
+	// 12k prefill (threshold: 13 children).
+	for i := 0; i < 13; i++ {
+		child := withRequestID(withHeader(chatRequest(fmt.Sprintf("child-%d", i), 49000), defaultRootHeaderName, "R"),
+			fmt.Sprintf("req-c%d", i))
+		scores := s.Score(context.Background(), child, []fwksched.Endpoint{podA, podB})
+		if i < 3 && scores[podA] <= scores[podB] {
+			t.Fatalf("lightly-stacked warm pod must still win at child %d: %v", i, scores)
+		}
+		s.PreRequest(context.Background(), child, schedulingResultFor(podA))
 	}
-	s.PreRequest(context.Background(), child1, schedulingResultFor(podA))
 
-	// child-2 arrives while child-1 still occupies pod-a: queued work
-	// (12251) outweighs the prefill saving (250), so the cold pod wins.
-	child2 := withRequestID(withHeader(chatRequest("child-2", 49000), defaultRootHeaderName, "R"), "req-c2")
-	scores = s.Score(context.Background(), child2, []fwksched.Endpoint{podA, podB})
+	overflow := withRequestID(withHeader(chatRequest("child-13", 49000), defaultRootHeaderName, "R"), "req-c13")
+	scores := s.Score(context.Background(), overflow, []fwksched.Endpoint{podA, podB})
 	if scores[podB] <= scores[podA] {
-		t.Fatalf("burst must spill from the busy warm pod: %v", scores)
+		t.Fatalf("burst must spill once stacked work outweighs the cold prefill: %v", scores)
 	}
 }
 
