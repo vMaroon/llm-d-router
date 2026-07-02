@@ -181,19 +181,15 @@ type SessionCoverage struct {
 // sessionEntry tracks one session's per-endpoint coverage high-water marks.
 type sessionEntry struct {
 	// coverage maps endpoint (namespaced pod name) to the highest token count
-	// known resident there for this session.
+	// known resident there for this session, in response-usage units.
 	coverage map[string]int64
-	lastSeen time.Time
-}
-
-func (e *sessionEntry) maxCoverage() int64 {
-	var m int64
-	for _, c := range e.coverage {
-		if c > m {
-			m = c
-		}
-	}
-	return m
+	// maxPromptEst is the highest router-side prompt estimate seen for this
+	// session. Rollover detection compares estimates against estimates: usage
+	// units and estimate units can differ by an arbitrary tokenizer-dependent
+	// scale, so comparing an incoming estimate against usage-fed coverage
+	// would misfire whenever the estimator runs low.
+	maxPromptEst int64
+	lastSeen     time.Time
 }
 
 // TypedName returns the typed name of the plugin.
@@ -255,13 +251,13 @@ func (s *SessionCoverage) coverageFor(ctx context.Context, sid string, promptTok
 	}
 
 	if s.rolloverRatio > 0 {
-		if best := entry.maxCoverage(); best > 0 && float64(promptTokens) < s.rolloverRatio*float64(best) {
+		if best := entry.maxPromptEst; best > 0 && float64(promptTokens) < s.rolloverRatio*float64(best) {
 			// The prompt shrank well below the session's known prefix: the
 			// history was rewritten (e.g. compaction). The old KV no longer
 			// prefix-matches, so drop the entry and let the session re-place.
 			delete(s.sessions, sid)
 			log.FromContext(ctx).V(logutil.DEFAULT).Info("session rollover detected, index entry reset",
-				"scorer", s.typedName.String(), "session", sid, "promptTokens", promptTokens, "bestCoverage", best)
+				"scorer", s.typedName.String(), "session", sid, "promptEstimate", promptTokens, "bestPromptEstimate", best)
 			return nil
 		}
 	}
@@ -290,7 +286,7 @@ func (s *SessionCoverage) PreRequest(ctx context.Context, request *fwksched.Infe
 	if x <= 0 {
 		return
 	}
-	s.bump(ctx, sid, pod, x)
+	s.bump(ctx, sid, pod, x, x)
 }
 
 // ResponseBody raises the serving endpoint's coverage to the token usage
@@ -310,7 +306,7 @@ func (s *SessionCoverage) ResponseBody(ctx context.Context, request *fwksched.In
 		return
 	}
 	pod := targetEndpoint.NamespacedName.String()
-	s.bump(ctx, sid, pod, total)
+	s.bump(ctx, sid, pod, total, 0)
 
 	if logger := log.FromContext(ctx); logger.V(logutil.TRACE).Enabled() {
 		cached := 0
@@ -324,9 +320,10 @@ func (s *SessionCoverage) ResponseBody(ctx context.Context, request *fwksched.In
 	}
 }
 
-// bump raises the session's coverage high-water mark on the given endpoint.
-// Coverage is monotone per endpoint; stale smaller values never overwrite.
-func (s *SessionCoverage) bump(ctx context.Context, sid, pod string, tokens int64) {
+// bump raises the session's coverage high-water mark on the given endpoint
+// and, when promptEst > 0, the session's prompt-estimate high-water mark.
+// Both are monotone; stale smaller values never overwrite.
+func (s *SessionCoverage) bump(ctx context.Context, sid, pod string, tokens, promptEst int64) {
 	now := s.now()
 
 	s.mu.Lock()
@@ -342,6 +339,9 @@ func (s *SessionCoverage) bump(ctx context.Context, sid, pod string, tokens int6
 	}
 	if tokens > entry.coverage[pod] {
 		entry.coverage[pod] = tokens
+	}
+	if promptEst > entry.maxPromptEst {
+		entry.maxPromptEst = promptEst
 	}
 	entry.lastSeen = now
 }

@@ -178,11 +178,12 @@ func TestScoreClampsToFullCoverage(t *testing.T) {
 func TestRolloverResetsSession(t *testing.T) {
 	s, _ := newTestScorer(parameters{})
 	podA := newEndpoint("pod-a")
-	request := chatRequest("s1", 40000)
+	request := chatRequest("s1", 40000) // estimate 10001
 
+	s.PreRequest(context.Background(), request, schedulingResultFor(podA))
 	s.ResponseBody(context.Background(), request, endOfStreamResponse(9500, 500), podA.GetMetadata())
 
-	// Prompt shrinks to ~2001 tokens < 0.5 * 10000: rollover.
+	// Prompt estimate shrinks to 2001 < 0.5 * 10001: rollover.
 	scores := s.Score(context.Background(), chatRequest("s1", 8000), []fwksched.Endpoint{podA})
 	expectScore(t, scores, podA, 0.0)
 
@@ -191,6 +192,31 @@ func TestRolloverResetsSession(t *testing.T) {
 	s.mu.Unlock()
 	if exists {
 		t.Error("session entry should be removed after rollover")
+	}
+}
+
+func TestRolloverComparesEstimateUnitsNotUsageUnits(t *testing.T) {
+	// Regression: usage-reported tokens can run well above the router-side
+	// estimate (token-dense text). A growing conversation must not be
+	// mistaken for a prefix rewrite just because estimate < usage coverage.
+	s, _ := newTestScorer(parameters{})
+	podA := newEndpoint("pod-a")
+	turn1 := chatRequest("s1", 4000) // estimate 1001
+
+	s.PreRequest(context.Background(), turn1, schedulingResultFor(podA))
+	// Real tokenizer reports ~2.4x the estimate.
+	s.ResponseBody(context.Background(), turn1, endOfStreamResponse(2400, 24), podA.GetMetadata())
+
+	// Turn 2 grows the text; estimate 1201 is still far below usage coverage
+	// 2424. No rollover may fire, and the covered pod scores full.
+	scores := s.Score(context.Background(), chatRequest("s1", 4800), []fwksched.Endpoint{podA})
+	expectScore(t, scores, podA, 1.0)
+
+	s.mu.Lock()
+	_, exists := s.sessions["s1"]
+	s.mu.Unlock()
+	if !exists {
+		t.Error("session entry must survive a growing conversation with estimate/usage scale mismatch")
 	}
 }
 
