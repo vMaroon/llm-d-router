@@ -20,9 +20,10 @@ Hybrid mode is the exception: rather than one aggregate fraction, it evaluates e
 **Heterogeneous Deployments:** Because this detector calculates saturation globally as a single aggregate fraction (in requests and tokens mode), it utilizes an aggregate queueing model. In deployments with heterogeneous compute (e.g., mixing H100 and L4 nodes), this heavily biases the pool saturation metric toward the state of the larger nodes. Contrast this with the Utilization Detector, which evaluates saturation as an unweighted average of individual endpoint scores.
 
 ### Role in Scheduling (The Traffic Shaper)
-The detector implements the `Filter` interface to protect individual endpoints. It removes endpoints from candidate lists if their local inflight count exceeds the safety limit:
+The detector implements the `Filter` interface to protect individual endpoints. In request mode it removes endpoints whose local in-flight request count reaches the safety limit. In token and hybrid modes it includes the incoming request's endpoint-specific uncached-token cost and removes endpoints whose projected load would exceed the safety limit:
 
     EndpointLimit = Capacity * (1 + Headroom)
+    ProjectedTokens = InflightTokens + IncomingUncachedTokens
 
 This approach allows the Flow Controller to manage average pool load, while the Scheduler retains the flexibility to burst above ideal targets (the "Headroom") to satisfy affinity or scoring objectives.
 

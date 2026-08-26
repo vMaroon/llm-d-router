@@ -103,7 +103,8 @@ func warmupChat(imageURLs ...string) *fwkrh.InferenceRequestBody {
 // renderBackend produces real token IDs and owns protocol dispatch, including
 // the pre-tokenized (Generate) passthrough.
 type renderBackend struct {
-	tk tokenizer
+	tk                         tokenizer
+	mergeAnthropicInlineSystem bool
 }
 
 // typedChatRenderer accepts the already-converted render request. The vLLM
@@ -133,7 +134,7 @@ func (b renderBackend) produce(ctx context.Context, body *fwkrh.InferenceRequest
 			err        error
 		)
 		if renderer, ok := b.tk.(typedChatRenderer); ok {
-			tokenIDs, mmFeatures, err = renderer.RenderChatRequest(ctx, MessagesToRenderChatRequest(body.Messages))
+			tokenIDs, mmFeatures, err = renderer.RenderChatRequest(ctx, messagesToRenderChatRequest(body.Messages, b.mergeAnthropicInlineSystem))
 		} else {
 			tokenIDs, mmFeatures, err = b.tk.RenderChat(ctx, messagesPayload(body))
 		}

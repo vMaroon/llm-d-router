@@ -66,9 +66,10 @@ var (
 
 // detector implements a saturation detector and scheduling filter based on active request concurrency.
 type detector struct {
-	config              config
-	typedName           fwkplugin.TypedName
-	inFlightLoadDataKey fwkplugin.DataKey
+	config                       config
+	typedName                    fwkplugin.TypedName
+	inFlightLoadDataKey          fwkplugin.DataKey
+	uncachedRequestTokensDataKey fwkplugin.DataKey
 }
 
 // newDetector creates a new instance of the Concurrency Detector.
@@ -92,9 +93,10 @@ func newDetector(name string, cfg config, logger logr.Logger) *detector {
 	}
 
 	return &detector{
-		config:              cfg,
-		typedName:           typedName,
-		inFlightLoadDataKey: attrconcurrency.InFlightLoadDataKey.WithNonEmptyProducerName(cfg.inFlightLoadProducerName),
+		config:                       cfg,
+		typedName:                    typedName,
+		inFlightLoadDataKey:          attrconcurrency.InFlightLoadDataKey.WithNonEmptyProducerName(cfg.inFlightLoadProducerName),
+		uncachedRequestTokensDataKey: attrconcurrency.UncachedRequestTokensDataKey.WithNonEmptyProducerName(cfg.inFlightLoadProducerName),
 	}
 }
 
@@ -104,8 +106,15 @@ func (d *detector) TypedName() fwkplugin.TypedName {
 }
 
 func (d *detector) Consumes() fwkplugin.DataDependencies {
+	required := map[fwkplugin.DataKey]any{
+		d.inFlightLoadDataKey: attrconcurrency.InFlightLoad{},
+	}
+	if d.config.mode == modeTokens || d.config.mode == modeHybrid {
+		required[d.uncachedRequestTokensDataKey] = attrconcurrency.UncachedRequestTokens{}
+	}
+
 	return fwkplugin.DataDependencies{
-		Required: map[fwkplugin.DataKey]any{d.inFlightLoadDataKey: attrconcurrency.InFlightLoad{}},
+		Required: required,
 	}
 }
 
@@ -117,6 +126,16 @@ func (d *detector) getLoad(m datalayer.AttributeMap) *attrconcurrency.InFlightLo
 	}
 
 	return &attrconcurrency.InFlightLoad{}
+}
+
+func (d *detector) getIncomingTokens(m datalayer.AttributeMap) int64 {
+	if val, ok := m.Get(d.uncachedRequestTokensDataKey); ok {
+		if tokens, ok := val.(*attrconcurrency.UncachedRequestTokens); ok && tokens.Tokens > 0 {
+			return tokens.Tokens
+		}
+	}
+
+	return 0
 }
 
 // Saturation calculates the saturation level of the pool.
@@ -180,10 +199,12 @@ func ratio(inflight, capacity int64) float64 {
 	return float64(inflight) / float64(capacity)
 }
 
-// Filter blocks traffic to specific endpoints that are physically saturated or exceeding their safety limits.
+// Filter blocks traffic to specific endpoints that would exceed their safety limits.
 //
 // It applies a relaxed limit (Capacity * (1 + Headroom)) to allow for scheduling flexibility and burst tolerance.
-// In "hybrid" mode an endpoint is dropped when either its request load or its token load reaches the limit.
+// Token and hybrid modes include the incoming request's endpoint-specific uncached-token cost in the projection.
+// In hybrid mode an endpoint is dropped when either its request load reaches the limit or its projected token load
+// exceeds the limit.
 func (d *detector) Filter(
 	_ context.Context,
 	_ *fwksched.InferenceRequest,
@@ -200,8 +221,9 @@ func (d *detector) Filter(
 			continue
 		}
 		load := d.getLoad(e)
+		incomingTokens := d.getIncomingTokens(e)
 
-		if d.admits(load, reqLimit, tokLimit) {
+		if d.admits(load, incomingTokens, reqLimit, tokLimit) {
 			filtered = append(filtered, e)
 		}
 	}
@@ -209,12 +231,14 @@ func (d *detector) Filter(
 }
 
 // admits reports whether an endpoint is below its safety limit for the active mode.
-func (d *detector) admits(load *attrconcurrency.InFlightLoad, reqLimit, tokLimit int64) bool {
+func (d *detector) admits(load *attrconcurrency.InFlightLoad, incomingTokens, reqLimit, tokLimit int64) bool {
+	projectedTokens := load.Tokens + incomingTokens
+
 	switch d.config.mode {
 	case modeTokens:
-		return load.Tokens < tokLimit
+		return projectedTokens <= tokLimit
 	case modeHybrid:
-		return load.Requests < reqLimit && load.Tokens < tokLimit
+		return load.Requests < reqLimit && projectedTokens <= tokLimit
 	default:
 		return load.Requests < reqLimit
 	}

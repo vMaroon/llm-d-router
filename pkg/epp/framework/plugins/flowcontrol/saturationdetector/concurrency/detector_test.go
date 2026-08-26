@@ -434,9 +434,9 @@ func TestDetector_TokenFilter(t *testing.T) {
 	reg := newLocalRegistry()
 	detector := newDetector("test-detector", config, logr.Discard())
 	endpointName := "token-filter-endpoint"
-	endpoints := []fwksched.Endpoint{newStubSchedulingEndpoint(reg, endpointName)}
 
-	// Drive 110 tokens (just below 120 burst limit) -> endpoint should pass filter.
+	// Drive 110 tokens. The candidate-aware guard evaluates the projected total
+	// against the 120-token burst limit.
 	// 4 input -> 10 total tokens per request * 11 requests = 110 tokens.
 	reqs := make([]*fwksched.InferenceRequest, 0, 11)
 	for i := range 11 {
@@ -444,15 +444,52 @@ func TestDetector_TokenFilter(t *testing.T) {
 	}
 	driveTokenLoad(ctx, reg, detector, endpointName, reqs)
 
-	kept := detector.Filter(ctx, nil, endpoints)
-	require.Len(t, kept, 1, "endpoint should pass filter below burst limit")
+	endpoint := newStubSchedulingEndpoint(reg, endpointName)
+	endpoint.incomingTokens = 9
+	kept := detector.Filter(ctx, nil, []fwksched.Endpoint{endpoint})
+	require.Len(t, kept, 1, "endpoint should pass when projected load is below the limit")
 
-	// Add one more request to reach 120 tokens -> filtered out
-	driveTokenLoad(ctx, reg, detector, endpointName, []*fwksched.InferenceRequest{
-		makeTokenRequest("r12", 4),
+	endpoint.incomingTokens = 10
+	kept = detector.Filter(ctx, nil, []fwksched.Endpoint{endpoint})
+	require.Len(t, kept, 1, "endpoint should pass when projected load equals the limit")
+
+	endpoint.incomingTokens = 11
+	kept = detector.Filter(ctx, nil, []fwksched.Endpoint{endpoint})
+	require.Len(t, kept, 0, "endpoint should be filtered when projected load exceeds the limit")
+}
+
+func TestDetector_TokenFilterContextPlusWaitingBudget(t *testing.T) {
+	t.Parallel()
+
+	const (
+		contextTokens = int64(265088)
+		waitingTokens = int64(6144)
+		totalBudget   = contextTokens + waitingTokens
+	)
+
+	reg := newLocalRegistry()
+	detector := newDetector("test-detector", config{
+		mode:                modeTokens,
+		maxTokenConcurrency: totalBudget,
+	}, logr.Discard())
+	endpointName := "context-budget-endpoint"
+	endpoint := newStubSchedulingEndpoint(reg, endpointName)
+	endpoint.incomingTokens = contextTokens
+
+	kept := detector.Filter(t.Context(), nil, []fwksched.Endpoint{endpoint})
+	require.Len(t, kept, 1, "an idle endpoint should admit one full-context request")
+
+	reg.update(fullEndpointName(endpointName), func(load *attrconcurrency.InFlightLoad) {
+		load.Tokens = waitingTokens
 	})
-	kept = detector.Filter(ctx, nil, endpoints)
-	require.Len(t, kept, 0, "endpoint should be filtered at burst limit")
+	kept = detector.Filter(t.Context(), nil, []fwksched.Endpoint{endpoint})
+	require.Len(t, kept, 1, "the full-context request should fit with exactly the waiting allowance")
+
+	reg.update(fullEndpointName(endpointName), func(load *attrconcurrency.InFlightLoad) {
+		load.Tokens++
+	})
+	kept = detector.Filter(t.Context(), nil, []fwksched.Endpoint{endpoint})
+	require.Empty(t, kept, "the endpoint should reject projected work above the total budget")
 }
 
 // TestDetector_TokenLifecycle verifies token accounting.
@@ -575,12 +612,13 @@ func TestDetector_HybridFilter(t *testing.T) {
 		name     string
 		requests int64
 		tokens   int64
+		incoming int64
 		wantKept int
 	}{
-		{name: "below_both_limits", requests: 5, tokens: 50, wantKept: 1},
-		{name: "request_limit_reached", requests: 10, tokens: 50, wantKept: 0},
-		{name: "token_limit_reached", requests: 5, tokens: 100, wantKept: 0},
-		{name: "both_over", requests: 20, tokens: 200, wantKept: 0},
+		{name: "below_both_limits", requests: 5, tokens: 50, incoming: 25, wantKept: 1},
+		{name: "request_limit_reached", requests: 10, tokens: 50, incoming: 25, wantKept: 0},
+		{name: "token_limit_reached", requests: 5, tokens: 100, incoming: 1, wantKept: 0},
+		{name: "both_over", requests: 20, tokens: 200, incoming: 1, wantKept: 0},
 	}
 
 	for _, tc := range tests {
@@ -594,7 +632,9 @@ func TestDetector_HybridFilter(t *testing.T) {
 				load.Tokens = tc.tokens
 			})
 
-			kept := detector.Filter(ctx, nil, []fwksched.Endpoint{newStubSchedulingEndpoint(reg, endpointName)})
+			endpoint := newStubSchedulingEndpoint(reg, endpointName)
+			endpoint.incomingTokens = tc.incoming
+			kept := detector.Filter(ctx, nil, []fwksched.Endpoint{endpoint})
 			require.Len(t, kept, tc.wantKept, "hybrid filter mismatch")
 		})
 	}
@@ -776,9 +816,10 @@ func newFakeEndpoint(reg *localRegistry, name string) datalayer.Endpoint {
 // liveSchedulingEndpoint is a "live" mock for scheduling.Endpoint.
 type liveSchedulingEndpoint struct {
 	fwksched.Endpoint
-	metadata *datalayer.EndpointMetadata
-	reg      *localRegistry
-	id       string
+	metadata       *datalayer.EndpointMetadata
+	reg            *localRegistry
+	id             string
+	incomingTokens int64
 }
 
 func newStubSchedulingEndpoint(reg *localRegistry, name string) *liveSchedulingEndpoint {
@@ -794,11 +835,17 @@ func (f *liveSchedulingEndpoint) Get(key fwkplugin.DataKey) (datalayer.Cloneable
 	if key == attrconcurrency.InFlightLoadDataKey {
 		return f.reg.get(f.id), true
 	}
+	if key == attrconcurrency.UncachedRequestTokensDataKey {
+		return &attrconcurrency.UncachedRequestTokens{Tokens: f.incomingTokens}, true
+	}
 	return nil, false
 }
 func (f *liveSchedulingEndpoint) Put(fwkplugin.DataKey, datalayer.Cloneable) {}
 func (f *liveSchedulingEndpoint) Keys() []fwkplugin.DataKey {
-	return []fwkplugin.DataKey{attrconcurrency.InFlightLoadDataKey}
+	return []fwkplugin.DataKey{
+		attrconcurrency.InFlightLoadDataKey,
+		attrconcurrency.UncachedRequestTokensDataKey,
+	}
 }
 func (f *liveSchedulingEndpoint) String() string                { return f.id }
 func (f *liveSchedulingEndpoint) Clone() datalayer.AttributeMap { return f }
