@@ -62,6 +62,10 @@ type flowController interface {
 	EnqueueAndWait(ctx context.Context, req flowcontrol.FlowControlRequest) (types.QueueOutcome, error)
 }
 
+type dispatchReservationReleaser interface {
+	ReleaseDispatchReservation(requestID string)
+}
+
 // rejectIfSheddableAndSaturated checks if a request should be immediately rejected.
 func rejectIfSheddableAndSaturated(
 	ctx context.Context,
@@ -188,6 +192,14 @@ func (fcac *FlowControlAdmissionController) Admit(
 		ttlPoolEmpty = len(fcac.endpointCandidates.Locate(ctx, nil)) == 0
 	}
 	return translateFlowControlOutcome(outcome, err, ttlPoolEmpty)
+}
+
+// ReleaseDispatchReservation forwards completion of the post-admission accounting window when
+// the configured flow controller supports dispatch reservations.
+func (fcac *FlowControlAdmissionController) ReleaseDispatchReservation(requestID string) {
+	if releaser, ok := fcac.flowController.(dispatchReservationReleaser); ok {
+		releaser.ReleaseDispatchReservation(requestID)
+	}
 }
 
 // flowControlRequest is an adapter that implements the FlowControlRequest interface.

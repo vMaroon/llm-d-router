@@ -71,11 +71,18 @@ var (
 // --- Mocks ---
 
 type mockAdmissionController struct {
-	admitErr error
+	admitErr        error
+	releaseDispatch func(requestID string)
 }
 
 func (m *mockAdmissionController) Admit(context.Context, *handlers.RequestContext, int) error {
 	return m.admitErr
+}
+
+func (m *mockAdmissionController) ReleaseDispatchReservation(requestID string) {
+	if m.releaseDispatch != nil {
+		m.releaseDispatch(requestID)
+	}
 }
 
 type mockScheduler struct {
@@ -2150,6 +2157,53 @@ func TestDirector_HandleRequest_ConditionalDecode(t *testing.T) {
 			assert.Equal(t, tt.wantErrCode, e.Code)
 		})
 	}
+}
+
+func TestDirector_ReleasesDispatchReservationAfterPreRequest(t *testing.T) {
+	endpoint := fwksched.NewEndpoint(&fwkdl.EndpointMetadata{
+		Address: "192.168.1.100",
+		Port:    "8000",
+		ID:      types.NamespacedName{Name: "pod1", Namespace: "default"},
+	}, nil, fwkdl.NewAttributes())
+	result := &fwksched.SchedulingResult{
+		PrimaryProfileName: "decode",
+		ProfileResults: map[string]*fwksched.ProfileRunResult{
+			"decode": {TargetEndpoints: []fwksched.Endpoint{endpoint}},
+		},
+	}
+	dir, ctx := newConditionalDecodeDirector(t, result)
+
+	released := false
+	dir.admissionController = &mockAdmissionController{releaseDispatch: func(requestID string) {
+		require.Equal(t, "test-reservation", requestID)
+		require.False(t, released, "reservation must be released exactly once")
+		released = true
+	}}
+	dir.requestControlPlugins = *NewConfig().WithPreRequestPlugins(&mockPreRequestPlugin{
+		name: "observe-reservation",
+		modifyFn: func(*fwksched.InferenceRequest) {
+			require.False(t, released, "reservation must cover all PreRequest hooks")
+		},
+	})
+
+	body, err := json.Marshal(map[string]any{"model": "m", "prompt": "p"})
+	require.NoError(t, err)
+	reqCtx := &handlers.RequestContext{
+		Request: &handlers.Request{
+			Headers: map[string]string{
+				reqcommon.RequestIDHeaderKey: "test-reservation",
+				":path":                      "/v1/completions",
+			},
+			RawBody: body,
+		},
+		Parser: openai.NewOpenAIParser(),
+	}
+	parseResult, err := reqCtx.Parser.ParseRequest(ctx, body, reqCtx.Request.Headers)
+	require.NoError(t, err)
+
+	_, err = dir.HandleRequest(ctx, reqCtx, parseResult.Body)
+	require.NoError(t, err)
+	require.True(t, released)
 }
 
 // TestRunPreRequestPlugins_NoPlugins verifies that runPreRequestPlugins returns
