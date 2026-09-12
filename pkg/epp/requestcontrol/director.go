@@ -331,8 +331,13 @@ func (d *Director) HandleRequest(ctx context.Context, reqCtx *handlers.RequestCo
 	// Prepare per request data by running DataProducer plugins.
 	err = d.runDataProducerPlugins(ctx, reqCtx.SchedulingRequest, snapshotOfCandidatePods)
 	if err != nil {
-		// Don't fail the request if DataProducer plugins fail.
 		logger.Error(err, "failed to prepare per request data")
+		// Generation must not reach scheduling with an incomplete producer pipeline.
+		// Raw passthrough APIs such as count_tokens have no generation body.
+		body := reqCtx.SchedulingRequest.Body
+		if body != nil && (body.Completions != nil || body.ChatCompletions != nil || body.Messages != nil || body.Generate != nil) {
+			return reqCtx, errcommon.Error{Code: errcommon.ServiceUnavailable, Msg: "failed to prepare per request data"}
+		}
 	}
 
 	// Run admit request plugins

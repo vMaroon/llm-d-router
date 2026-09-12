@@ -133,7 +133,9 @@ func (b renderBackend) produce(ctx context.Context, body *fwkrh.InferenceRequest
 			mmFeatures *tokenization.MultiModalFeatures
 			err        error
 		)
-		if renderer, ok := b.tk.(typedChatRenderer); ok {
+		if renderer, ok := b.tk.(*vllmHTTPRenderer); ok && renderer.nativeMessages {
+			tokenIDs, mmFeatures, err = renderer.RenderMessages(ctx, body.Payload)
+		} else if renderer, ok := b.tk.(typedChatRenderer); ok {
 			tokenIDs, mmFeatures, err = renderer.RenderChatRequest(ctx, messagesToRenderChatRequest(body.Messages, b.mergeAnthropicInlineSystem))
 		} else {
 			tokenIDs, mmFeatures, err = b.tk.RenderChat(ctx, messagesPayload(body))

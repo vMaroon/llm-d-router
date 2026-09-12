@@ -255,7 +255,10 @@ func (d *detector) Filter(
 			continue
 		}
 		load := d.getLoad(e)
-		incomingTokens := d.getIncomingTokens(e)
+		var incomingTokens int64
+		if d.config.mode == modeTokens || d.config.mode == modeHybrid {
+			incomingTokens = d.getIncomingTokens(e)
+		}
 
 		if d.admits(load, incomingTokens, reqLimit, tokLimit) {
 			filtered = append(filtered, e)

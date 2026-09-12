@@ -35,10 +35,12 @@ import (
 	tokenizerTypes "github.com/llm-d/llm-d-router/pkg/kvcache/tokenization/types"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
 	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
+	sourcenotifications "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/source/notifications"
 )
 
 type tokenizer interface {
@@ -284,6 +286,7 @@ func LegacyPluginFactory(name string, rawParameters *json.Decoder, handle plugin
 // vllm /render (selected by 'vllm' or 'modelName'), or estimate byte-packing
 // (the default when no backend is set).
 func NewPlugin(ctx context.Context, name string, config *tokenizerPluginConfig) (*Plugin, error) {
+	var endpointPicker *discoveredEndpointPicker
 	var backend tokenInputProducer
 	switch {
 	case config.TokenizerConfig.IsEnabled():
@@ -309,6 +312,10 @@ func NewPlugin(ctx context.Context, name string, config *tokenizerPluginConfig) 
 			tk:                         renderer,
 			mergeAnthropicInlineSystem: cfg.MergeAnthropicInlineSystem,
 		}
+		endpointPicker, _ = renderer.endpointPicker.(*discoveredEndpointPicker)
+		if endpointPicker != nil && endpointPicker.config.DiscoverModelLimits {
+			go endpointPicker.watchModelLimits(ctx, renderer.client, config.ModelName)
+		}
 	default:
 		backend = estimateBackend{img: newImageEstimator(config.Estimate), vid: newVideoEstimator(config.Estimate)}
 	}
@@ -317,6 +324,9 @@ func NewPlugin(ctx context.Context, name string, config *tokenizerPluginConfig) 
 		typedName: plugin.TypedName{Type: PluginType, Name: name},
 		backend:   backend,
 		dk:        TokenizedPromptDataKey.WithNonEmptyProducerName(name),
+	}
+	if endpointPicker != nil {
+		p.endpointDiscovery = newEndpointDiscoveryHandler(p.TypedName(), endpointPicker)
 	}
 	if w, ok := backend.(warmer); ok {
 		go w.warmup(ctx)
@@ -327,9 +337,22 @@ func NewPlugin(ctx context.Context, name string, config *tokenizerPluginConfig) 
 // Plugin tokenizes the prompt in the incoming request and writes the result to
 // InferenceRequestBody.TokenizedPrompt for downstream DataProducer / scoring plugins.
 type Plugin struct {
-	typedName plugin.TypedName
-	backend   tokenInputProducer
-	dk        plugin.DataKey
+	endpointDiscovery *endpointDiscoveryHandler
+	typedName         plugin.TypedName
+	backend           tokenInputProducer
+	dk                plugin.DataKey
+}
+
+func (p *Plugin) RegisterDependencies(r datalayer.Registrar) error {
+	if p.endpointDiscovery == nil {
+		return nil
+	}
+	return r.Register(datalayer.PendingRegistration{
+		Owner:         p.TypedName(),
+		SourceType:    sourcenotifications.EndpointNotificationSourceType,
+		Extractor:     p.endpointDiscovery,
+		DefaultSource: sourcenotifications.NewEndpointDataSource(sourcenotifications.EndpointNotificationSourceType, sourcenotifications.EndpointNotificationSourceType),
+	})
 }
 
 // compile-time assertions.

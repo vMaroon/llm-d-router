@@ -124,6 +124,7 @@ func (ds *mockDatastore) PodList(predicate func(fwkdl.Endpoint) bool) []fwkdl.En
 }
 
 type mockDataProducerPlugin struct {
+	err      error
 	name     string
 	produces map[fwkplugin.DataKey]any
 	consumes map[fwkplugin.DataKey]any
@@ -142,6 +143,9 @@ func (m *mockDataProducerPlugin) Consumes() fwkplugin.DataDependencies {
 }
 
 func (m *mockDataProducerPlugin) Produce(ctx context.Context, request *fwksched.InferenceRequest, endpoints []fwksched.Endpoint) error {
+	if m.err != nil {
+		return m.err
+	}
 	endpoints[0].Put(mockProducedDataKey, mockProducedDataType{value: 42})
 	return nil
 }
@@ -432,6 +436,7 @@ func TestDirector_HandleRequest(t *testing.T) {
 		fairnessIDHeader        string // If non-empty, set as metadata.FlowFairnessIDKey on the incoming request.
 		wantFairnessID          string // If non-empty, asserted against returnedReqCtx.SchedulingRequest.FairnessID.
 		rewrites                []*v1alpha2.InferenceModelRewrite
+		rawPassthrough          bool
 	}{
 		{
 			name: "successful completions request",
@@ -743,6 +748,27 @@ func TestDirector_HandleRequest(t *testing.T) {
 				},
 			},
 			targetModelName: model,
+		},
+		{
+			name:                    "failed DataProducer must not reach scheduling",
+			reqBodyMap:              map[string]any{"model": model, "prompt": "critical prompt"},
+			mockAdmissionController: &mockAdmissionController{},
+			dataProducerPlugin:      &mockDataProducerPlugin{name: "token-producer", err: errors.New("render unavailable")},
+			wantErrCode:             errcommon.ServiceUnavailable,
+			schedulerMockSetup: func(m *mockScheduler) {
+				m.scheduleErr = errcommon.Error{Code: errcommon.Internal, Msg: "scheduler must not be called"}
+			},
+		},
+		{
+			name:                    "raw token count passthrough tolerates unsupported tokenization",
+			reqBodyMap:              map[string]any{"model": model, "prompt": "critical prompt"},
+			rawPassthrough:          true,
+			mockAdmissionController: &mockAdmissionController{},
+			dataProducerPlugin:      &mockDataProducerPlugin{name: "token-producer", err: errors.New("unsupported request body type, skipping tokenization")},
+			schedulerMockSetup: func(m *mockScheduler) {
+				m.scheduleErr = errcommon.Error{Code: errcommon.PreconditionFailed, Msg: "passthrough reached scheduler"}
+			},
+			wantErrCode: errcommon.PreconditionFailed,
 		},
 		{
 			name: "successful chat completions request with DataProducer plugins",
@@ -1131,6 +1157,9 @@ func TestDirector_HandleRequest(t *testing.T) {
 
 				reqCtx.Parser = openai.NewOpenAIParser()
 				parseResult, parseErr := reqCtx.Parser.ParseRequest(ctx, reqCtx.Request.RawBody, reqCtx.Request.Headers)
+				if test.rawPassthrough {
+					parseResult.Body = &fwkrh.InferenceRequestBody{Model: model, Payload: fwkrh.RawPayload(reqCtx.Request.RawBody)}
+				}
 				var returnedReqCtx *handlers.RequestContext
 				if parseErr != nil {
 					err = errcommon.Error{Code: errcommon.BadRequest, Msg: parseErr.Error()}
