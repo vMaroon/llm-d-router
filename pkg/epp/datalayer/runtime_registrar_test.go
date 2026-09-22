@@ -1,5 +1,5 @@
 /*
-Copyright 2025 The llm-d Authors.
+Copyright 2025 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -196,6 +196,35 @@ func TestConfigure_PendingRegistrationYieldsToConfigByType(t *testing.T) {
 			}
 			assert.Equal(t, tc.wantNames, gotNames)
 		})
+	}
+}
+
+func TestConfigure_SelfRegisteredInstances(t *testing.T) {
+	for _, reverse := range []bool{false, true} {
+		for _, explicit := range []bool{false, true} {
+			r := NewRuntime(0)
+			src := notifications.NewEndpointDataSource(notifications.EndpointNotificationSourceType, "ep-src")
+			first := extractormocks.NewEndpointExtractor("first")
+			second := extractormocks.NewEndpointExtractor("second")
+			order := []fwkplugin.Plugin{first, second, first}
+			if reverse {
+				order = []fwkplugin.Plugin{second, first, second}
+			}
+			for _, ext := range order {
+				require.NoError(t, r.Register(fwkdl.PendingRegistration{
+					Owner: ext.TypedName(), SourceType: notifications.EndpointNotificationSourceType, Extractor: ext,
+				}))
+			}
+			cfg := &Config{Sources: []DataSourceConfig{{Plugin: src}}}
+			if explicit {
+				cfg.Sources[0].Extractors = []fwkplugin.Plugin{first}
+			}
+			require.NoError(t, r.Configure(cfg, newTestLogger(t)))
+			exts, ok := r.extractors.Get("ep-src")
+			require.True(t, ok)
+			require.Len(t, exts, 2, "each named self-registration must bind exactly once")
+			require.ElementsMatch(t, []fwkplugin.Plugin{first, second}, exts)
+		}
 	}
 }
 

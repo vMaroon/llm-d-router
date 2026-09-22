@@ -71,7 +71,7 @@ func (s *SGLangAdapter) ShardingKey(msg *kvevents.RawMessage) string {
 func (s *SGLangAdapter) ParseMessage(msg *kvevents.RawMessage) (string, string, kvevents.EventBatch, error) {
 	podID, modelName := parseTopic(msg.Topic)
 
-	var batch msgpackEventBatch
+	var batch msgpackSGLangEventBatch
 	if err := msgpack.Unmarshal(msg.Payload, &batch); err != nil {
 		return "", "", kvevents.EventBatch{}, fmt.Errorf("failed to decode SGLang event batch: %w", err)
 	}
@@ -86,12 +86,20 @@ func (s *SGLangAdapter) ParseMessage(msg *kvevents.RawMessage) (string, string, 
 	}
 
 	eventBatch := kvevents.EventBatch{
-		Timestamp:        batch.TS,
-		Events:           genericEvents,
-		DataParallelRank: batch.DataParallelRank,
+		Timestamp: batch.TS,
+		Events:    genericEvents,
 	}
 
 	return podID, modelName, eventBatch, nil
+}
+
+// SGLang msgpack event structures.
+// These match the vLLM wire format (SGLang uses the same positional encoding).
+type msgpackSGLangEventBatch struct {
+	_                struct{} `msgpack:",array"`
+	TS               float64
+	Events           []msgpack.RawMessage
+	DataParallelRank *int `msgpack:",omitempty"`
 }
 
 type msgpackSGLangBlockStoredEvent struct {

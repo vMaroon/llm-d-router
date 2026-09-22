@@ -1,5 +1,5 @@
 /*
-Copyright 2025 The llm-d Authors.
+Copyright 2025 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -41,9 +41,7 @@ func newHandleWithPlugin(t *testing.T, name string, p fwkplugin.Plugin) fwkplugi
 func discoveryConfigRef(ref string) *configapi.EndpointPickerConfig {
 	return &configapi.EndpointPickerConfig{
 		DataLayer: &configapi.DataLayerConfig{
-			Discovery: &configapi.DiscoveryConfig{
-				Endpoints: &configapi.EndpointDiscoveryConfig{PluginRef: ref},
-			},
+			Discovery: &configapi.DiscoveryConfig{PluginRef: ref},
 		},
 	}
 }

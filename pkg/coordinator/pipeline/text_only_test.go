@@ -25,7 +25,6 @@ import (
 	"sync/atomic"
 	"testing"
 
-	reqcommon "github.com/llm-d/llm-d-router/pkg/common/request"
 	"github.com/llm-d/llm-d-router/pkg/coordinator/config"
 	"github.com/llm-d/llm-d-router/pkg/coordinator/gateway"
 	"github.com/llm-d/llm-d-router/pkg/coordinator/pipeline"
@@ -110,7 +109,7 @@ func TestTextOnlyRequest_SkipsMediaDownloadAndEncode(t *testing.T) {
 
 	reqCtx := &pipeline.RequestContext{
 		RequestID:        "text-only-test",
-		OriginalPath:     reqcommon.PathChatCompletions,
+		OriginalPath:     gateway.PathChatCompletions,
 		OriginalBody:     mustJSON(body),
 		Body:             body,
 		Model:            "llama-3",

@@ -1,6 +1,5 @@
 /*
 Copyright 2025 The Kubernetes Authors.
-Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -36,9 +35,7 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	"github.com/llm-d/llm-d-router/pkg/common/observability/logging"
-	metricsutil "github.com/llm-d/llm-d-router/pkg/common/observability/metrics"
 	"github.com/llm-d/llm-d-router/pkg/common/routing"
-	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 )
 
 const (
@@ -101,10 +98,6 @@ type Options struct {
 	LoRAInfoMetric                   string        // Prometheus metric specification for the LoRA info metrics.
 	CacheInfoMetric                  string        // Prometheus metric specification for the cache info metrics.
 	//
-	// Plugin state.
-	//
-	PluginStateStalenessThreshold time.Duration // Inactivity duration after which a request's plugin state is reaped.
-	//
 	// Diagnostics.
 	//
 	logging.LoggingOptions           // Logging configuration.
@@ -124,16 +117,11 @@ type Options struct {
 	MetricsClientCAFile     string   // PEM CA that requires a verified client cert on the metrics endpoint.
 	MetricsCertDir          string   // Directory with the metrics server certificates that enables metrics TLS.
 	EnableGRPCStreamMetrics bool     // Enables ext_proc gRPC stream metrics (in-flight gauge, hold duration, completions counter by code).
-	// FairnessIDMetricLabelLimit caps the number of distinct fairness_id label values recorded on metrics; values
-	// beyond the cap collapse to a single overflow series, and 0 collapses all of them. Bounds metric cardinality in
-	// deployments with many distinct fairness IDs.
-	FairnessIDMetricLabelLimit int
 	//
 	// Configuration.
 	//
-	ConfigFile   string   // The path to the configuration file.
-	ConfigText   string   // The configuration specified as text, in lieu of a file.
-	FeatureGates []string // Feature gates applied on top of the configuration's featureGates.
+	ConfigFile string // The path to the configuration file.
+	ConfigText string // The configuration specified as text, in lieu of a file.
 
 	AllowExperimentalPlugins bool // Allows loading of experimental Alpha plugins.
 
@@ -159,11 +147,9 @@ func NewOptions() *Options {
 		KVCacheUsagePercentageMetric:     "vllm:kv_cache_usage_perc",
 		LoRAInfoMetric:                   "vllm:lora_requests_info",
 		CacheInfoMetric:                  "vllm:cache_config_info",
-		PluginStateStalenessThreshold:    fwkplugin.DefaultStalenessThreshold,
 		LoggingOptions:                   *logging.NewOptions(),
 		Tracing:                          true,
 		MetricsPort:                      9090,
-		FairnessIDMetricLabelLimit:       metricsutil.DefaultFairnessIDLabelLimit,
 		GRPCHealthPort:                   9003,
 		EnablePprof:                      true,
 		SecureServing:                    true,
@@ -222,10 +208,6 @@ func (opts *Options) AddFlags(fs *pflag.FlagSet) {
 	fs.StringVar(&opts.CacheInfoMetric, "cache-info-metric", opts.CacheInfoMetric, "Prometheus metric for the cache info metrics.")
 	_ = fs.MarkDeprecated("cache-info-metric", "use engineConfigs in EndpointPickerConfig instead")
 
-	fs.DurationVar(&opts.PluginStateStalenessThreshold, "plugin-state-staleness-threshold", opts.PluginStateStalenessThreshold,
-		"Inactivity duration after which a request's plugin state (e.g. in-flight load accounting) is reaped. "+
-			"Set this above the maximum expected request duration to avoid releasing in-flight accounting for long-running requests.")
-
 	opts.LoggingOptions.AddFlags(fs) // Add logging flags.
 
 	fs.BoolVar(&opts.Tracing, "tracing", opts.Tracing, "Enables emitting traces.")
@@ -243,9 +225,6 @@ func (opts *Options) AddFlags(fs *pflag.FlagSet) {
 		"Enables certificate reloading of the certificates specified in --cert-path.")
 	fs.BoolVar(&opts.EnableGRPCStreamMetrics, "enable-grpc-stream-metrics", opts.EnableGRPCStreamMetrics,
 		"Enables ext_proc gRPC stream metrics (in-flight gauge, hold-duration histogram, completions counter by code).")
-	fs.IntVar(&opts.FairnessIDMetricLabelLimit, "fairness-id-metric-label-limit", opts.FairnessIDMetricLabelLimit,
-		"Caps the number of distinct fairness_id label values recorded on metrics; values beyond the cap collapse to a "+
-			"single overflow series, and 0 collapses all of them. Bounds metric cardinality with many distinct fairness IDs.")
 	fs.BoolVar(&opts.SecureServing, "secure-serving", opts.SecureServing, "Enables secure serving.")
 	fs.StringVar(&opts.TLSMinVersion, "tls-min-version", opts.TLSMinVersion,
 		"Minimum TLS version for secure serving (e.g., VersionTLS12, VersionTLS13).")
@@ -259,10 +238,6 @@ func (opts *Options) AddFlags(fs *pflag.FlagSet) {
 		"Directory with the metrics server certificates. Enables TLS on the metrics endpoint.")
 	fs.StringVar(&opts.ConfigFile, "config-file", opts.ConfigFile, "The path to the configuration file.")
 	fs.StringVar(&opts.ConfigText, "config-text", opts.ConfigText, "The configuration specified as text, in lieu of a file.")
-	fs.StringSliceVar(&opts.FeatureGates, "feature-gates", opts.FeatureGates,
-		"Comma-separated list of feature gates to enable or disable, in kubelet style "+
-			"(e.g., 'flowControl=true'). A bare name enables the gate. Applied after the "+
-			"configuration's featureGates list, so these override entries set there.")
 	fs.BoolVar(&opts.AllowExperimentalPlugins, "allow-experimental-plugins", opts.AllowExperimentalPlugins,
 		"Allows loading of experimental Alpha plugins.")
 }
@@ -417,24 +392,11 @@ func (opts *Options) Validate() error {
 			"requested", opts.RefreshMetricsInterval, "effective", MinRefreshMetricsInterval)
 		opts.RefreshMetricsInterval = MinRefreshMetricsInterval
 	}
-	if opts.RefreshPrometheusMetricsInterval <= 0 {
-		return fmt.Errorf("refresh-prometheus-metrics-interval must be positive, got %v", opts.RefreshPrometheusMetricsInterval)
-	}
 	if opts.GRPCMaxRecvMsgSize < 0 {
 		return fmt.Errorf("grpc-max-recv-msg-size must be non-negative, got %d", opts.GRPCMaxRecvMsgSize)
 	}
 	if opts.GRPCMaxSendMsgSize < 0 {
 		return fmt.Errorf("grpc-max-send-msg-size must be non-negative, got %d", opts.GRPCMaxSendMsgSize)
-	}
-	if opts.FairnessIDMetricLabelLimit < 0 {
-		return fmt.Errorf("fairness-id-metric-label-limit must be non-negative, got %d", opts.FairnessIDMetricLabelLimit)
-	}
-
-	if opts.PluginStateStalenessThreshold <= 0 {
-		return fmt.Errorf("plugin-state-staleness-threshold must be positive, got %v", opts.PluginStateStalenessThreshold)
-	}
-	if opts.MetricsStalenessThreshold <= 0 {
-		return fmt.Errorf("metrics-staleness-threshold must be positive, got %v", opts.MetricsStalenessThreshold)
 	}
 
 	// Validate deprecated metric flags are not explicitly set

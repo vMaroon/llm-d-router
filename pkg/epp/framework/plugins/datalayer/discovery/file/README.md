@@ -72,8 +72,7 @@ plugins:
       watchFile: true
 dataLayer:
   discovery:
-    endpoints:
-      pluginRef: file-discovery
+    pluginRef: file-discovery
 ```
 
 A two-endpoint file referenced by the config above:

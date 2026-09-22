@@ -20,14 +20,17 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/kvcache/kvblock"
 )
 
-// NewIndexerForTest constructs an Indexer with injected dependencies and hit
-// metrics enabled. Exported only for testing via the export_test.go pattern.
-func NewIndexerForTest(tp kvblock.TokenProcessor, idx kvblock.Index, backends []*KVCacheBackendConfig) *Indexer {
-	return newIndexer(tp, idx, backends, true)
-}
-
-// NewIndexerForTestWithoutMetrics is NewIndexerForTest with hit metrics
-// disabled, as a deployment without EnableMetrics runs.
-func NewIndexerForTestWithoutMetrics(tp kvblock.TokenProcessor, idx kvblock.Index, backends []*KVCacheBackendConfig) *Indexer {
-	return newIndexer(tp, idx, backends, false)
+// NewIndexerForTest constructs an Indexer with injected dependencies.
+// Exported only for testing via the export_test.go pattern.
+func NewIndexerForTest(tp kvblock.TokenProcessor, idx kvblock.Index, scorer KVBlockScorer) *Indexer {
+	tierWeights := map[string]float64{}
+	if lps, ok := scorer.(*LongestPrefixScorer); ok {
+		tierWeights = lps.MediumWeights
+	}
+	return &Indexer{
+		tokenProcessor: tp,
+		kvBlockIndex:   idx,
+		kvBlockScorer:  scorer,
+		tierWeights:    tierWeights,
+	}
 }

@@ -1,5 +1,5 @@
 /*
-Copyright 2025 The llm-d Authors.
+Copyright 2025 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -22,26 +22,18 @@ import (
 	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 )
 
-// InitializeAttributeStore allocates the request attribute store before the
-// request is shared across goroutines. The data-producer executor calls this
-// before starting a producer so a producer that outlives its cancelled context
-// can safely finish a sync.Map operation while scheduling reads attributes.
-func (r *InferenceRequest) InitializeAttributeStore() {
-	if r.attributes == nil {
-		r.attributes = &sync.Map{}
-	}
-}
-
 // PutAttribute stores value at key in the request's attribute store.
 // The backing store is lazily allocated on first write.
-// Call InitializeAttributeStore before sharing a request across goroutines.
+// Callers must not write concurrently to the same request from multiple goroutines.
 //
 // Keys are DataKey values for the same reason the endpoint AttributeMap uses
 // them: the per-request store is the other half of the producer/consumer
 // exchange, so a plugin reaches an entry only through a key it names in
 // Produces() or Consumes().
 func (r *InferenceRequest) PutAttribute(key fwkplugin.DataKey, value any) {
-	r.InitializeAttributeStore()
+	if r.attributes == nil {
+		r.attributes = &sync.Map{}
+	}
 	r.attributes.Store(key, value)
 }
 

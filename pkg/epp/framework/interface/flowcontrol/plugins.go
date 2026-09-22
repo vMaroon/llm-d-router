@@ -1,6 +1,5 @@
 /*
 Copyright 2025 The Kubernetes Authors.
-Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -127,16 +126,10 @@ type SaturationDetector interface {
 	Saturation(ctx context.Context, endpoints []datalayer.Endpoint) float64
 }
 
-// Pipeline stages named by WithSaturationStage.
-const (
-	SaturationStagePrefill = "prefill"
-	SaturationStageDecode  = "decode"
-)
-
 type saturationStageKey struct{}
 
-// WithSaturationStage returns a context naming the pipeline stage (SaturationStagePrefill or
-// SaturationStageDecode) whose endpoints a SaturationDetector.Saturation call evaluates.
+// WithSaturationStage returns a context naming the pipeline stage ("prefill" or "decode") whose
+// endpoints a SaturationDetector.Saturation call evaluates.
 func WithSaturationStage(ctx context.Context, stage string) context.Context {
 	return context.WithValue(ctx, saturationStageKey{}, stage)
 }
@@ -146,6 +139,25 @@ func WithSaturationStage(ctx context.Context, stage string) context.Context {
 func SaturationStageFromContext(ctx context.Context) string {
 	stage, _ := ctx.Value(saturationStageKey{}).(string)
 	return stage
+}
+
+// DispatchReservationTracker closes the observation gap between flow-control dispatch and the
+// request lifecycle hooks that publish in-flight load. A reservation is created immediately
+// before a request is released from the flow-control queue and removed after PreRequest hooks
+// have published the request to the endpoint load signal.
+//
+// Implementations MUST be goroutine-safe. Request IDs are the reservation identity; duplicate
+// reserve and release calls must be idempotent.
+type DispatchReservationTracker interface {
+	ReserveDispatch(requestID string) bool
+	ReleaseDispatch(requestID string) bool
+}
+
+// TokenDispatchReservationTracker reserves undiscounted input work before
+// preparation. ReleaseDispatch removes both the request and token reservation.
+type TokenDispatchReservationTracker interface {
+	DispatchReservationTracker
+	ReserveDispatchTokens(requestID string, inputTokens int64) bool
 }
 
 // UsageLimitPolicy computes the usage limit of a priority band dynamically.

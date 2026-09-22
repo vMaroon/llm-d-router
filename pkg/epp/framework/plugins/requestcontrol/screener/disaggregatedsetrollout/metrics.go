@@ -1,5 +1,5 @@
 /*
-Copyright 2026 The llm-d Authors.
+Copyright 2026 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -30,16 +30,16 @@ import (
 const metricsPrefix = "disaggregatedset"
 
 var (
-	strictRevisionNoMatchTotal = prometheus.NewCounterVec(
+	strictHeaderNoMatchTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Subsystem: eppmetrics.LLMDRouterEndpointPickerSubsystem,
-			Name:      metricsPrefix + "_strict_revision_no_match_total",
+			Name:      metricsPrefix + "_strict_header_no_match_total",
 			Help: metricsutil.HelpMsgWithStability(
-				"Strict revision selections that matched no endpoint and failed closed.",
+				"Strict header selections that matched no endpoint and failed closed.",
 				compbasemetrics.ALPHA,
 			),
 		},
-		[]string{"plugin_type", "plugin_name"},
+		[]string{"plugin_type", "plugin_name", "selector"},
 	)
 
 	revisionGatingShare = prometheus.NewGaugeVec(
@@ -60,14 +60,14 @@ var registerMetricsOnce sync.Once
 func registerMetrics() {
 	registerMetricsOnce.Do(func() {
 		ctrlmetrics.Registry.MustRegister(
-			strictRevisionNoMatchTotal,
+			strictHeaderNoMatchTotal,
 			revisionGatingShare,
 		)
 	})
 }
 
-func recordStrictRevisionNoMatch(pluginName string) {
-	strictRevisionNoMatchTotal.WithLabelValues(PluginType, pluginName).Inc()
+func recordStrictHeaderNoMatch(pluginName, selectorName string) {
+	strictHeaderNoMatchTotal.WithLabelValues(PluginType, pluginName, selectorName).Inc()
 }
 
 func recordRevisionGatingShares(

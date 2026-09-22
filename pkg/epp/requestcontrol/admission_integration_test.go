@@ -1,5 +1,5 @@
 /*
-Copyright 2026 The llm-d Authors.
+Copyright 2026 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -100,10 +100,7 @@ func newRealFlowControlHarness(t *testing.T, opts realFlowControlOpts) *realFlow
 	}
 	candidates := &mocks.MockEndpointCandidates{Candidates: opts.candidates}
 	fc := fccontroller.NewFlowController(ctx, "test-pool", &fccontroller.Config{
-		DefaultRequestTTL: requestTTL,
-		// Both unavailability regimes share one budget, as they do under the shipped defaults, so requestTTL
-		// bounds queue wait whether or not the pool has endpoints.
-		NoEndpointRequestTTL:     requestTTL,
+		DefaultRequestTTL:        requestTTL,
 		ExpiryCleanupInterval:    10 * time.Millisecond,
 		EnqueueChannelBufferSize: 100,
 	}, fccontroller.Deps{
@@ -199,7 +196,7 @@ func TestFlowControlAdmissionController_RealControllerSeam(t *testing.T) {
 		})
 
 		filler := admitAsync(ctx, h.ac, "filler-req")
-		require.Eventually(t, func() bool { return h.reg.Stats().Global.Len == 1 },
+		require.Eventually(t, func() bool { return h.reg.Stats().TotalLen == 1 },
 			time.Second, time.Millisecond, "filler request should be queued before the overflow request")
 
 		err := waitAdmit(t, admitAsync(ctx, h.ac, "overflow-req"))
@@ -221,7 +218,7 @@ func TestFlowControlAdmissionController_RealControllerSeam(t *testing.T) {
 		})
 
 		filler := admitAsync(ctx, h.ac, "filler-req")
-		require.Eventually(t, func() bool { return h.reg.Stats().Global.Len == 1 },
+		require.Eventually(t, func() bool { return h.reg.Stats().TotalLen == 1 },
 			time.Second, time.Millisecond, "filler request should be queued before the overflow request")
 
 		err := waitAdmit(t, admitAsync(ctx, h.ac, "overflow-req"))
@@ -273,7 +270,7 @@ func TestFlowControlAdmissionController_RealControllerSeam(t *testing.T) {
 		admitCtx, admitCancel := context.WithCancel(ctx)
 		defer admitCancel()
 		result := admitAsync(admitCtx, h.ac, "cancel-req")
-		require.Eventually(t, func() bool { return h.reg.Stats().Global.Len == 1 },
+		require.Eventually(t, func() bool { return h.reg.Stats().TotalLen == 1 },
 			time.Second, time.Millisecond, "request should be queued before cancelling")
 		admitCancel()
 

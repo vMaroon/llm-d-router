@@ -1,6 +1,5 @@
 /*
 Copyright 2025 The Kubernetes Authors.
-Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -49,17 +48,8 @@ type managedQueue struct {
 	policy flowcontrol.OrderingPolicy
 	logger logr.Logger
 
-	// bandStats and registryStats receive this queue's measured statistics deltas: the owning priority band's
-	// counters and the registry-wide totals. Never nil.
-	bandStats     *occupancyStats
-	registryStats *occupancyStats
-
-	// onActiveTransition is invoked when the queue transitions between empty and non-empty, so the
-	// owning priority band can maintain its index of active (non-empty) queues. Transitions are
-	// detected under `mu`, which serializes them per queue. The callback must be lock-free or take
-	// only leaf locks (never the registry mutex): it runs inside this queue's critical section.
-	// May be nil (e.g., in isolated unit tests).
-	onActiveTransition func(mq *managedQueue, active bool)
+	// onStatsDelta is the callback used to propagate statistics changes up to the registry.
+	onStatsDelta propagateStatsDeltaFunc
 
 	// --- State Protected by `mu` ---
 
@@ -81,19 +71,15 @@ func newManagedQueue(
 	policy flowcontrol.OrderingPolicy,
 	key flowcontrol.FlowKey,
 	logger logr.Logger,
-	bandStats *occupancyStats,
-	registryStats *occupancyStats,
-	onActiveTransition func(mq *managedQueue, active bool),
+	onStatsDelta propagateStatsDeltaFunc,
 ) *managedQueue {
 	mqLogger := logger.WithName("managed-queue").WithValues("flowKey", key)
 	mq := &managedQueue{
-		queue:              queue,
-		policy:             policy,
-		key:                key,
-		bandStats:          bandStats,
-		registryStats:      registryStats,
-		onActiveTransition: onActiveTransition,
-		logger:             mqLogger,
+		queue:        queue,
+		policy:       policy,
+		key:          key,
+		onStatsDelta: onStatsDelta,
+		logger:       mqLogger,
 	}
 	mq.flowQueueAccessor = &flowQueueAccessor{mq: mq}
 	return mq
@@ -196,27 +182,13 @@ func (mq *managedQueue) applyAndPropagateLocked(mutate func()) {
 
 	mutate()
 
-	afterLen := mq.queue.Len()
-	lenDelta := int64(afterLen - beforeLen)
+	lenDelta := int64(mq.queue.Len() - beforeLen)
 	byteSizeDelta := int64(mq.queue.ByteSize()) - int64(beforeBytes)
 	if lenDelta == 0 && byteSizeDelta == 0 {
 		return
 	}
-
-	// Maintain the band's active-queue index on empty<->non-empty transitions. `mu` is held, so
-	// transitions are strictly alternating per queue.
-	if mq.onActiveTransition != nil {
-		if beforeLen == 0 && afterLen > 0 {
-			mq.onActiveTransition(mq, true)
-		} else if beforeLen > 0 && afterLen == 0 {
-			mq.onActiveTransition(mq, false)
-		}
-	}
-
-	// Apply the delta to the owning band's counters and the registry-wide totals.
-	// These updates are lock-free and eventually consistent.
-	mq.bandStats.add(lenDelta, byteSizeDelta)
-	mq.registryStats.add(lenDelta, byteSizeDelta)
+	// Propagate the delta up to the registry. This propagation is lock-free and eventually consistent.
+	mq.onStatsDelta(mq.key.Priority, lenDelta, byteSizeDelta)
 }
 
 // --- `flowQueueAccessor` ---

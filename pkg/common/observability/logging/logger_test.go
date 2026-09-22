@@ -40,69 +40,54 @@ func TestCustomLevelEncoder(t *testing.T) {
 		{
 			name:     "Standard Info (0)",
 			level:    zapcore.InfoLevel, // 0
-			expected: "INFO",
+			expected: "info",
 		},
 		{
 			name:     "Standard Warn (1)",
 			level:    zapcore.WarnLevel, // 1
-			expected: "WARN",
+			expected: "warn",
 		},
 		{
 			name:     "Standard Error (2)",
 			level:    zapcore.ErrorLevel, // 2
-			expected: "ERROR",
-		},
-		{
-			name:     "DPanic (3)",
-			level:    zapcore.DPanicLevel,
-			expected: "DPANIC",
-		},
-		{
-			name:     "Panic (4)",
-			level:    zapcore.PanicLevel,
-			expected: "PANIC",
-		},
-		{
-			name:     "Fatal (5)",
-			level:    zapcore.FatalLevel,
-			expected: "FATAL",
+			expected: "error",
 		},
 		{
 			name:     "V(1) (-1)",
 			level:    zapcore.Level(-1),
-			expected: "DEBUG",
+			expected: "info",
 		},
 		{
 			name:     "V(2) Default (-2)",
 			level:    zapcore.Level(-2),
-			expected: "DEBUG",
+			expected: "info",
 		},
 		{
 			name:     "Verbose (-3)",
 			level:    zapcore.Level(-3),
-			expected: "DEBUG",
+			expected: "info",
 		},
 		{
 			name:     "Debug (-4)",
 			level:    zapcore.Level(-4),
-			expected: "DEBUG",
+			expected: "debug",
 		},
 		{
 			name:     "Trace (-5)",
 			level:    zapcore.Level(-5),
-			expected: "DEBUG",
+			expected: "trace",
 		},
 		{
 			name:     "Extremely Verbose (-6)",
 			level:    zapcore.Level(-6),
-			expected: "DEBUG",
+			expected: "trace",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			enc := &mockArrayEncoder{}
-			LevelEncoder(tt.level, enc)
+			customLevelEncoder(tt.level, enc)
 			if len(enc.strings) != 1 {
 				t.Fatalf("Expected 1 string appended, got %d", len(enc.strings))
 			}

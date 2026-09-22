@@ -1,5 +1,5 @@
 /*
-Copyright 2025 The llm-d Authors.
+Copyright 2025 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -34,9 +34,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	healthPb "google.golang.org/grpc/health/grpc_health_v1"
 
-	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
 	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
-	localsyncer "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/cross_plugin/local"
 	runserver "github.com/llm-d/llm-d-router/pkg/epp/server"
 )
 
@@ -47,14 +45,11 @@ import (
 // RunnableGroup's Ready() gate firing once the plugin loads its initial file,
 // and (c) the health and ext_proc gRPC servers binding their ports.
 func TestRunWithFileDiscovery_Smoke(t *testing.T) {
-	fwkplugin.Register(localsyncer.LocalSyncerType, fwkplugin.StabilityBeta, localsyncer.LocalSyncerFactory)
-
 	dir := t.TempDir()
 	endpointsPath := filepath.Join(dir, "endpoints.yaml")
 	require.NoError(t, os.WriteFile(endpointsPath, []byte(
 		"endpoints:\n"+
 			"  - name: stub\n"+
-			"    namespace: test-ns\n"+
 			"    address: 127.0.0.1\n"+
 			"    port: \"19999\"\n"), 0o644))
 
@@ -74,18 +69,12 @@ plugins:
     type: metrics-data-source
   - name: metrics-extractor
     type: core-metrics-extractor
-  - name: local-syncer
-    type: local-syncer
-  - name: inflight-load-producer
-    type: inflight-load-producer
 schedulingProfiles:
   - name: default
     plugins:
       - pluginRef: random-picker
 dataLayer:
   injectDefaults: false
-  crossReplicaSyncerPluginRef: local-syncer
-  crossReplicaSyncInterval: 5ms
   discovery:
     pluginRef: file-discovery
   sources:
@@ -119,7 +108,6 @@ dataLayer:
 	require.NoError(t, err)
 	require.NotNil(t, rawConfig.DataLayer)
 	require.NotNil(t, rawConfig.DataLayer.Discovery)
-	require.NotNil(t, rawConfig.DataLayer.Discovery.Endpoints)
 
 	runErr := make(chan error, 1)
 	go func() { runErr <- r.runWithFileDiscovery(ctx, opts, rawConfig) }()
@@ -194,13 +182,6 @@ dataLayer:
 	require.NoError(t, err)
 	assert.Equal(t, "file-discovery", disc.TypedName().Type)
 	assert.Equal(t, "file-discovery", disc.TypedName().Name)
-
-	syncer, ok := r.PluginHandle.Plugin("local-syncer").(fwkdl.CrossReplicaSyncer)
-	require.True(t, ok)
-	require.Eventually(t, func() bool {
-		_, found, err := syncer.Get(ctx, fwkdl.StateKey("inflight:inflight-load-producer"), "test-ns/stub")
-		return err == nil && found
-	}, 2*time.Second, 10*time.Millisecond, "file-discovery endpoints should publish cross-replica state")
 
 	cancel()
 	select {

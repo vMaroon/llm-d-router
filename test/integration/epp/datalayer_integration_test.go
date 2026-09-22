@@ -1,6 +1,5 @@
 /*
 Copyright 2025 The Kubernetes Authors.
-Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -26,7 +25,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/testing/protocmp"
 
-	"github.com/llm-d/llm-d-router/test/integration"
+	integration "github.com/llm-d/llm-d-router/test/integration"
 )
 
 // TestFullDuplexStreamed_DataLayer runs integration tests through the datalayer metrics pipeline.

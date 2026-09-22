@@ -19,7 +19,6 @@ package steps
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -27,7 +26,6 @@ import (
 	"strings"
 	"testing"
 
-	reqcommon "github.com/llm-d/llm-d-router/pkg/common/request"
 	"github.com/llm-d/llm-d-router/pkg/coordinator/config"
 	"github.com/llm-d/llm-d-router/pkg/coordinator/connectors/kv"
 	"github.com/llm-d/llm-d-router/pkg/coordinator/gateway"
@@ -72,9 +70,14 @@ func TestDecodeStep_NonStreaming(t *testing.T) {
 			t.Errorf("kv_transfer_params.do_remote_prefill = %v, want true", kvParams["do_remote_prefill"])
 		}
 
-		// Verify no tokens field (dead field, never consumed downstream)
-		if _, ok := parsed["tokens"]; ok {
-			t.Fatal("decode request should not have a tokens field")
+		// Verify tokens field present for chat completions format
+		tokens, ok := parsed["tokens"].(map[string]any)
+		if !ok {
+			t.Fatal("expected tokens field in chat/completions decode request")
+		}
+		tokenIDs, _ := tokens["token_ids"].([]any)
+		if len(tokenIDs) != 5 {
+			t.Fatalf("expected 5 token_ids in tokens field, got %d", len(tokenIDs))
 		}
 
 		// Verify uuid was injected into the image_url content part
@@ -173,7 +176,7 @@ func TestDecodeStep_CompletionsFormat_NoRenderedTokens(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	reqCtx := &pipeline.RequestContext{
 		RequestID:        "req-compl",
-		OriginalPath:     reqcommon.PathCompletions,
+		OriginalPath:     gateway.PathCompletions,
 		Model:            "test-model",
 		TokenIDs:         nil,
 		KVTransferParams: map[string]any{},
@@ -214,7 +217,7 @@ func TestDecodeStep_GenerateFormat_NestsKVInExtraArgs(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	reqCtx := &pipeline.RequestContext{
 		RequestID:        "req-gen",
-		OriginalPath:     reqcommon.PathGenerate,
+		OriginalPath:     gateway.DefaultGeneratePath,
 		Model:            "test-model",
 		TokenIDs:         []int{1, 2, 3, 4, 5},
 		KVTransferParams: map[string]any{"block_id": wantBlockID, "peer_host": "10.0.0.42", "peer_port": 7777},
@@ -349,12 +352,8 @@ func TestDecodeStep_GatewayError(t *testing.T) {
 	}
 
 	err := step.Execute(context.Background(), reqCtx)
-	var streamed *pipeline.UpstreamStreamedError
-	if !errors.As(err, &streamed) {
-		t.Fatalf("expected *pipeline.UpstreamStreamedError, got %T (%v)", err, err)
-	}
-	if streamed.StatusCode != http.StatusBadGateway {
-		t.Fatalf("expected StatusCode=502 on the streamed error, got %d", streamed.StatusCode)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
 
 	result := recorder.Result()
@@ -365,80 +364,5 @@ func TestDecodeStep_GatewayError(t *testing.T) {
 	respBody, _ := io.ReadAll(result.Body)
 	if !strings.Contains(string(respBody), "upstream unavailable") {
 		t.Fatalf("expected error body forwarded, got: %s", string(respBody))
-	}
-}
-
-// TestDecodeStep_NilClientTransport builds a step around a gateway.Client whose
-// Transport() returns nil. gateway.NewWithTransport documents that as valid and
-// leaves the default-transport fallback to http.Client; the timedRoundTripper
-// wrapper must reproduce the same fallback so the step does not panic.
-func TestDecodeStep_NilClientTransport(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(w).Encode(map[string]any{"choices": []map[string]any{{"text": "ok"}}})
-	}))
-	defer server.Close()
-
-	gwClient := gateway.NewWithTransport(nil, server.URL)
-	step, err := NewDecodeStep(gwClient, map[string]any{})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	recorder := httptest.NewRecorder()
-	reqCtx := &pipeline.RequestContext{
-		RequestID:        "req-1",
-		OriginalPath:     testChatCompletionsPath,
-		Model:            "test",
-		Stream:           false,
-		KVTransferParams: map[string]any{},
-		Body:             map[string]any{"model": "test", "stream": false},
-		ResponseWriter:   recorder,
-	}
-
-	if err := step.Execute(context.Background(), reqCtx); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if got := recorder.Result().StatusCode; got != http.StatusOK {
-		t.Fatalf("expected 200, got %d", got)
-	}
-}
-
-func TestDecodeStep_TransportError(t *testing.T) {
-	// Start a server, capture its URL, then close it: subsequent connects fail
-	// before any HTTP response arrives. This exercises the ErrorHandler branch
-	// of newDecodeProxy, not the ModifyResponse branch used by TestDecodeStep_GatewayError.
-	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {}))
-	serverURL := server.URL
-	server.Close()
-
-	gwClient := gateway.New(config.GatewayConfig{Address: serverURL})
-	step, _ := NewDecodeStep(gwClient, map[string]any{})
-
-	recorder := httptest.NewRecorder()
-	reqCtx := &pipeline.RequestContext{
-		RequestID:        "req-1",
-		OriginalPath:     testChatCompletionsPath,
-		Model:            "test",
-		Stream:           false,
-		KVTransferParams: map[string]any{},
-		Body:             map[string]any{"model": "test", "stream": false},
-		ResponseWriter:   recorder,
-	}
-
-	err := step.Execute(context.Background(), reqCtx)
-	var streamed *pipeline.UpstreamStreamedError
-	if !errors.As(err, &streamed) {
-		t.Fatalf("expected *pipeline.UpstreamStreamedError, got %T (%v)", err, err)
-	}
-	if streamed.StatusCode != 0 {
-		t.Fatalf("transport error must carry StatusCode=0, got %d", streamed.StatusCode)
-	}
-	if streamed.Cause == nil {
-		t.Fatalf("transport error must carry Cause, got nil")
-	}
-
-	result := recorder.Result()
-	if result.StatusCode != http.StatusBadGateway {
-		t.Fatalf("expected ErrorHandler-written 502, got %d", result.StatusCode)
 	}
 }

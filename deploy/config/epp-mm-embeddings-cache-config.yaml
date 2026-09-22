@@ -17,7 +17,7 @@ plugins:
   - type: precise-prefix-cache-producer
     parameters:
       tokenProcessorConfig:
-        blockSizeTokens: 64
+        blockSize: 64
       indexerConfig:
         kvBlockIndexConfig:
           enableMetrics: true

@@ -19,7 +19,6 @@ package kvcache
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	"github.com/llm-d/llm-d-router/pkg/kvcache/kvblock"
 )
@@ -46,11 +45,8 @@ func DefaultKVBlockScorerConfig() *KVBlockScorerConfig {
 	}
 }
 
-// KVBlockScorer scores a materialized lookup result.
-//
-// Deprecated: the prefix matcher (Indexer.MatchBlockKeys) is the single
-// implementation of longest-prefix scoring; LongestPrefixScorer.Score
-// projects it over a Lookup result for callers that hold one.
+// KVBlockScorer defines the interface for implementing a KV block scoring
+// strategy.
 type KVBlockScorer interface {
 	// Strategy returns the scoring strategy type.
 	Strategy() KVScoringStrategy
@@ -64,22 +60,18 @@ type KVBlockScorer interface {
 func NewKVBlockScorer(config *KVBlockScorerConfig) (KVBlockScorer, error) {
 	switch config.ScoringStrategy {
 	case LongestPrefixMatch:
+		// Build weight map from list of BackendConfigs for efficient lookup
+		weightMap := make(map[string]float64)
+		for _, medium := range config.BackendConfigs {
+			weightMap[medium.Name] = medium.Weight
+		}
+
 		return &LongestPrefixScorer{
-			MediumWeights: tierWeightsFromBackends(config.BackendConfigs),
+			MediumWeights: weightMap,
 		}, nil
 	default:
 		return nil, fmt.Errorf("unsupported scoring strategy: %s", config.ScoringStrategy)
 	}
-}
-
-// tierWeightsFromBackends maps each configured backend's device tier to its
-// scoring weight.
-func tierWeightsFromBackends(backends []*KVCacheBackendConfig) map[string]float64 {
-	weights := make(map[string]float64, len(backends))
-	for _, medium := range backends {
-		weights[strings.ToLower(medium.Name)] = medium.Weight
-	}
-	return weights
 }
 
 // LongestPrefixScorer scores based on longest consecutive block matches count
@@ -94,20 +86,69 @@ func (s *LongestPrefixScorer) Strategy() KVScoringStrategy {
 	return LongestPrefixMatch
 }
 
-// Score projects the prefix matcher's weighted score over a materialized
-// lookup result.
+// fillMaxWeights populates dst with the maximum weight per podID across all
+// device tiers for the given entries. The caller must clear dst before calling.
+func fillMaxWeights(dst map[string]float64, entries []kvblock.PodEntry, mediumWeights map[string]float64) {
+	for _, entry := range entries {
+		weight := 1.0
+		if mediumWeights != nil {
+			if w, exists := mediumWeights[entry.DeviceTier]; exists {
+				weight = w
+			}
+		}
+		if cur, exists := dst[entry.PodIdentifier]; !exists || weight > cur {
+			dst[entry.PodIdentifier] = weight
+		}
+	}
+}
+
+// Score implements the longest prefix scoring logic with weighted sum based on BackendConfig.
 func (s *LongestPrefixScorer) Score(
-	ctx context.Context,
+	_ context.Context,
 	keys []kvblock.BlockHash,
 	keyToPods map[kvblock.BlockHash][]kvblock.PodEntry,
 ) (map[string]float64, error) {
-	matches, err := matchMaterialized(ctx, keys, keyToPods, s.MediumWeights, nil)
-	if err != nil {
-		return nil, err
+	if len(keys) == 0 {
+		return make(map[string]float64), nil
 	}
-	scores := make(map[string]float64, len(matches))
-	for pod, m := range matches {
-		scores[pod] = m.WeightedScore
+
+	podScores := make(map[string]float64)
+
+	// Scratch map reused across iterations to avoid per-key allocation.
+	curWeights := make(map[string]float64)
+
+	// Build weight index for the first key in a single pass over entries.
+	fillMaxWeights(curWeights, keyToPods[keys[0]], s.MediumWeights)
+
+	// activePods tracks pods still in the consecutive prefix chain.
+	// Using a plain map and in-place deletion avoids allocating new sets
+	// on every iteration.
+	activePods := make(map[string]struct{}, len(curWeights))
+	for pod, w := range curWeights {
+		activePods[pod] = struct{}{}
+		podScores[pod] = w
 	}
-	return scores, nil
+
+	for i := 1; i < len(keys); i++ {
+		if len(activePods) == 0 {
+			break
+		}
+
+		// Reuse scratch map: clear and refill for current key.
+		clear(curWeights)
+		fillMaxWeights(curWeights, keyToPods[keys[i]], s.MediumWeights)
+
+		// In-place intersection: delete pods from activePods that are not
+		// in the current key, and accumulate scores for those that remain.
+		for pod := range activePods {
+			if w, exists := curWeights[pod]; exists {
+				podScores[pod] += w
+			} else {
+				delete(activePods, pod)
+			}
+		}
+	}
+
+	// Return the map containing the final score for each pod encountered.
+	return podScores, nil
 }

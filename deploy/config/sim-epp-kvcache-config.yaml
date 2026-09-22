@@ -7,11 +7,11 @@ plugins:
   parameters:
     modelName: TinyLlama/TinyLlama-1.1B-Chat-v1.0  # replace to use a different model
     vllm:
-      url: ${VLLM_RENDER_URL}  # substituted by kind-dev-env.sh envsubst (render Service)
+      url: http://localhost:8000
 - type: precise-prefix-cache-producer
   parameters:
     tokenProcessorConfig:
-      blockSizeTokens: 16
+      blockSize: 16
     kvEventsConfig:
       zmqEndpoint: tcp://0.0.0.0:5557
     indexerConfig:

@@ -1,6 +1,5 @@
 /*
 Copyright 2025 The Kubernetes Authors.
-Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,8 +17,6 @@ limitations under the License.
 package registry
 
 import (
-	"time"
-
 	"github.com/llm-d/llm-d-router/pkg/epp/flowcontrol/contracts"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/flowcontrol"
 )
@@ -42,9 +39,4 @@ func (c *connection) GetDataPlane() contracts.FlowRegistryDataPlane {
 // FlowKey returns the immutable identity of the flow this connection is pinned to.
 func (c *connection) FlowKey() flowcontrol.FlowKey {
 	return c.key
-}
-
-// DefaultRequestTTL returns the queue-wait bound configured for the leased priority band and whether it was set.
-func (c *connection) DefaultRequestTTL() (time.Duration, bool) {
-	return c.registry.priorityBandDefaultRequestTTL(c.key.Priority)
 }

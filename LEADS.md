@@ -41,4 +41,3 @@ Former maintainers, with thanks for their contributions.
 
 - @kfswain
 - @nirrozenbaum
-- @shmuelk

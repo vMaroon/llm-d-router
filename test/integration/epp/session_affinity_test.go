@@ -1,5 +1,5 @@
 /*
-Copyright 2026 The llm-d Authors.
+Copyright 2026 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -32,7 +32,7 @@ import (
 	sessionutil "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/util/sessionaffinity"
 	"github.com/llm-d/llm-d-router/pkg/epp/metadata"
 	testutil "github.com/llm-d/llm-d-router/pkg/epp/util/testing"
-	"github.com/llm-d/llm-d-router/test/integration"
+	integration "github.com/llm-d/llm-d-router/test/integration"
 )
 
 // TestSessionAffinityFilter_RequestFlow validates the end-to-end session

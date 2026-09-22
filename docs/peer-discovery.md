@@ -23,7 +23,7 @@ set of live EPP replicas and feeds it to consumers through a `PeerNotifier`.
 
 Peer discovery mirrors the [endpoint discovery](discovery.md) plugin model:
 
-- It is configured via `dataLayer.discovery.peers.pluginRef` in the
+- It is configured via `dataLayer.peerDiscovery.pluginRef` in the
   `EndpointPickerConfig`.
 - Implementations are registered in the plugin registry and selected by name.
 - When omitted, peer discovery is disabled and no peer set is maintained.
@@ -107,7 +107,7 @@ returning a deterministically ordered snapshot of the current peer set.
 
 ## Selecting a peer discovery plugin in the EPP config
 
-Add a `peers` entry inside `dataLayer.discovery` in the
+Add a `peerDiscovery` section inside `dataLayer` in the
 `EndpointPickerConfig`. The `pluginRef` field names a plugin instance defined
 in the top-level `plugins` list.
 
@@ -119,12 +119,11 @@ plugins:
       # plugin-specific parameters
 
 dataLayer:
-  discovery:
-    peers:
-      pluginRef: my-peer-disc  # must match a name in plugins above
+  peerDiscovery:
+    pluginRef: my-peer-disc    # must match a name in plugins above
 ```
 
-When `dataLayer.discovery.peers` is absent, peer discovery is disabled and no
+When `dataLayer.peerDiscovery` is absent, peer discovery is disabled and no
 peer set is maintained (backwards compatible).
 
 ---
@@ -209,7 +208,6 @@ plugins:
     parameters: {}
 
 dataLayer:
-  discovery:
-    peers:
-      pluginRef: my-peer-disc
+  peerDiscovery:
+    pluginRef: my-peer-disc
 ```

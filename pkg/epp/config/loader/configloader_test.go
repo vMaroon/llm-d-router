@@ -1,6 +1,5 @@
 /*
 Copyright 2025 The Kubernetes Authors.
-Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -45,12 +44,10 @@ import (
 	sourcemetrics "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/source/metrics"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/flowcontrol/fairness/globalstrict"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/flowcontrol/ordering/fcfs"
-	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/flowcontrol/saturationdetector/composite"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/flowcontrol/usagelimits"
 	reqdataprodprefix "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/approximateprefix"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requesthandling/parsers/anthropic"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requesthandling/parsers/openai"
-	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requesthandling/parsers/passthrough"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requesthandling/parsers/vertexai"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requesthandling/parsers/vllmhttp"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/picker/maxscore"
@@ -76,39 +73,6 @@ const (
 	testFeatureGate = "test-feature-gate"
 )
 
-type testCrossReplicaSyncer struct{}
-
-func (testCrossReplicaSyncer) TypedName() fwkplugin.TypedName {
-	return fwkplugin.TypedName{Type: "test-syncer", Name: "test-syncer"}
-}
-
-func (testCrossReplicaSyncer) Set(context.Context, fwkdl.StateKey, string, any, func([]any) any) error {
-	return nil
-}
-
-func (testCrossReplicaSyncer) Get(context.Context, fwkdl.StateKey, string) (any, bool, error) {
-	return nil, false, nil
-}
-
-func (testCrossReplicaSyncer) Delete(context.Context, fwkdl.StateKey, string) error {
-	return nil
-}
-
-func (testCrossReplicaSyncer) GetOrSet(_ context.Context, _ fwkdl.StateKey, _ string, candidate any) (any, bool, error) {
-	return candidate, false, nil
-}
-
-func TestBuildDataLayerConfigExposesCrossReplicaSyncerOnHandle(t *testing.T) {
-	handle := fwkplugin.NewEppHandle(context.Background(), nil)
-	syncer := &testCrossReplicaSyncer{}
-	handle.AddPlugin("syncer", syncer)
-
-	cfg, err := buildDataLayerConfig(&configapi.DataLayerConfig{CrossReplicaSyncerPluginRef: "syncer"}, handle)
-	require.NoError(t, err)
-	require.Same(t, syncer, cfg.Syncer)
-	require.Same(t, syncer, handle.CrossReplicaSyncer())
-}
-
 // --- Test: Phase 1 (Raw Loading & Static Defaults) ---
 
 func TestLoadRawConfiguration(t *testing.T) {
@@ -128,7 +92,6 @@ func TestLoadRawConfiguration(t *testing.T) {
 		want         *configapi.EndpointPickerConfig
 		wantFeatures map[string]bool
 		wantErr      bool
-		wantErrMsg   string
 		deprecated   bool
 	}{
 		{
@@ -300,8 +263,8 @@ func TestLoadRawConfiguration(t *testing.T) {
 			deprecated: false,
 		},
 		{
-			name:       "Success - Deprecated discovery.pluginRef",
-			configText: successDeprecatedDiscoveryPluginRefText,
+			name:       "Success - Deprecated Top-level SaturationDetector",
+			configText: successDeprecatedTopLevelSaturationDetectorText,
 			want: &configapi.EndpointPickerConfig{
 				TypeMeta: metav1.TypeMeta{
 					Kind:       "EndpointPickerConfig",
@@ -309,7 +272,41 @@ func TestLoadRawConfiguration(t *testing.T) {
 				},
 				Plugins: []configapi.PluginSpec{
 					{Name: "maxScore", Type: "max-score-picker"},
-					{Name: "my-disc", Type: "file-discovery"},
+				},
+				SchedulingProfiles: []configapi.SchedulingProfile{
+					{
+						Name: "default",
+						Plugins: []configapi.SchedulingPlugin{
+							{PluginRef: "maxScore"},
+						},
+					},
+				},
+				FeatureGates: configapi.FeatureGates{
+					flowcontrol.FeatureGate,
+				},
+				FlowControl: &configapi.FlowControlConfig{
+					SaturationDetector: &configapi.SaturationDetectorConfig{
+						PluginRef: "utilization-detector",
+					},
+				},
+				SaturationDetector: &configapi.SaturationDetectorConfig{
+					PluginRef: "utilization-detector",
+				},
+			},
+			wantErr:    false,
+			deprecated: true,
+		},
+		{
+			name:       "Success - Deprecated Top-level Parser",
+			configText: successDeprecatedTopLevelParserText,
+			want: &configapi.EndpointPickerConfig{
+				TypeMeta: metav1.TypeMeta{
+					Kind:       "EndpointPickerConfig",
+					APIVersion: configapi.GroupVersion.String(),
+				},
+				Plugins: []configapi.PluginSpec{
+					{Name: "maxScore", Type: "max-score-picker"},
+					{Name: "openai-parser", Type: "openai-parser"},
 				},
 				SchedulingProfiles: []configapi.SchedulingProfile{
 					{
@@ -320,29 +317,17 @@ func TestLoadRawConfiguration(t *testing.T) {
 					},
 				},
 				FeatureGates: configapi.FeatureGates{},
-				DataLayer: &configapi.DataLayerConfig{
-					Discovery: &configapi.DiscoveryConfig{
-						PluginRef: "my-disc",
-						Endpoints: &configapi.EndpointDiscoveryConfig{
-							PluginRef: "my-disc",
-						},
+				RequestHandler: &configapi.RequestHandlerConfig{
+					Parsers: []configapi.ParserConfig{
+						{PluginRef: "openai-parser"},
 					},
+				},
+				Parser: &configapi.ParserConfig{
+					PluginRef: "openai-parser",
 				},
 			},
 			wantErr:    false,
 			deprecated: true,
-		},
-		{
-			name:       "Error - Removed Top-level SaturationDetector",
-			configText: errorRemovedTopLevelSaturationDetectorText,
-			wantErr:    true,
-			wantErrMsg: `unknown field "saturationDetector"`,
-		},
-		{
-			name:       "Error - Removed Top-level Parser",
-			configText: errorRemovedTopLevelParserText,
-			wantErr:    true,
-			wantErrMsg: `unknown field "parser"`,
 		},
 		{
 			name:       "Error - Invalid YAML",
@@ -374,9 +359,6 @@ func TestLoadRawConfiguration(t *testing.T) {
 
 			if tc.wantErr {
 				require.Error(t, err, "Expected LoadRawConfig to fail")
-				if tc.wantErrMsg != "" {
-					require.ErrorContains(t, err, tc.wantErrMsg)
-				}
 				return
 			}
 			require.NoError(t, err, "Expected LoadRawConfig to succeed")
@@ -393,92 +375,6 @@ func TestLoadRawConfiguration(t *testing.T) {
 			} else {
 				require.False(t, tc.deprecated, "Valid configuration was marked as deprecated")
 			}
-		})
-	}
-}
-
-// TestLoadRawConfigExtraGates verifies that flag-supplied feature gates are appended to the
-// configuration's own featureGates list, and so take precedence over it. The rawConfig assertion
-// matters as much as the map: InstantiateAndConfigure and validateConfig each re-derive gate from
-// rawConfig.FeatureGates, so a gate applied only to the returned map would leave them disagreeing.
-func TestLoadRawConfigExtraGates(t *testing.T) {
-	t.Parallel()
-
-	RegisterFeatureGate(testFeatureGate, true)
-	RegisterFeatureGate(flowcontrol.FeatureGate, false)
-
-	tests := []struct {
-		name       string
-		configText string
-		extraGates []string
-		wantGates  map[string]bool
-		wantRaw    configapi.FeatureGates
-		wantErr    bool
-	}{
-		{
-			name:       "flag gate with no config",
-			extraGates: []string{flowcontrol.FeatureGate},
-			wantGates: map[string]bool{
-				testFeatureGate:         true,
-				flowcontrol.FeatureGate: true,
-			},
-			wantRaw: configapi.FeatureGates{flowcontrol.FeatureGate},
-		},
-		{
-			name:       "flag explicit false overrides registered default",
-			extraGates: []string{testFeatureGate + "=false"},
-			wantGates: map[string]bool{
-				testFeatureGate:         false,
-				flowcontrol.FeatureGate: false,
-			},
-			wantRaw: configapi.FeatureGates{testFeatureGate + "=false"},
-		},
-		{
-			name:       "bare flag gate overrides file's explicit false",
-			configText: successNoProfilesText,
-			extraGates: []string{testFeatureGate},
-			wantGates: map[string]bool{
-				testFeatureGate:         true,
-				flowcontrol.FeatureGate: false,
-			},
-			wantRaw: configapi.FeatureGates{testFeatureGate + "=false", testFeatureGate},
-		},
-		{
-			name: "no flag gates leaves config untouched",
-			wantGates: map[string]bool{
-				testFeatureGate:         true,
-				flowcontrol.FeatureGate: false,
-			},
-			wantRaw: configapi.FeatureGates{},
-		},
-		{
-			name:       "unregistered flag gate is rejected",
-			extraGates: []string{"no-such-gate"},
-			wantErr:    true,
-		},
-		{
-			name:       "non-boolean flag value is rejected",
-			extraGates: []string{flowcontrol.FeatureGate + "=notabool"},
-			wantErr:    true,
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			logger := logging.NewTestLogger()
-
-			got, gates, err := LoadRawConfig([]byte(tc.configText), logger, tc.extraGates...)
-
-			if tc.wantErr {
-				require.Error(t, err, "Expected LoadRawConfig to fail")
-				return
-			}
-			require.NoError(t, err, "Expected LoadRawConfig to succeed")
-
-			require.Empty(t, cmp.Diff(tc.wantGates, gates), "Resolved feature gates mismatch")
-			require.Empty(t, cmp.Diff(tc.wantRaw, got.FeatureGates),
-				"rawConfig.FeatureGates must carry the flag entries so later phases derive the same gates")
 		})
 	}
 }
@@ -501,14 +397,6 @@ func TestPluginsWithDependencies(t *testing.T) {
 		{
 			name:       "pluginsOutOfOrder",
 			configText: pluginsOutOfOrderText,
-		},
-		{
-			name:       "maxSaturationDetectorSortsBeforeChildren",
-			configText: maxSaturationDetectorSortsBeforeChildrenText,
-		},
-		{
-			name:       "maxSaturationDetectorStageScoped",
-			configText: maxSaturationDetectorStageScopedText,
 		},
 		{
 			name:       "pluginsRefedByPointer",
@@ -614,19 +502,6 @@ func TestInstantiateAndConfigure(t *testing.T) {
 			},
 		},
 		{
-			name:       "Success - Flow Control No-Endpoint TTL Follows Default",
-			configText: successFlowControlInheritedTTLText,
-			wantErr:    false,
-			validate: func(t *testing.T, _ fwkplugin.Handle, _ *configapi.EndpointPickerConfig, cfg *config.Config) {
-				require.NotNil(t, cfg.FlowControlConfig, "FlowControl config should have been loaded")
-				require.NotNil(t, cfg.FlowControlConfig.Controller, "Controller config should be present")
-				require.Equal(t, time.Duration(0), cfg.FlowControlConfig.Controller.DefaultRequestTTL,
-					"an explicit 0s should disable eviction while the pool has endpoints")
-				require.Equal(t, time.Duration(0), cfg.FlowControlConfig.Controller.NoEndpointRequestTTL,
-					"an unset no-endpoint budget should follow defaultRequestTTL, so 0s disables eviction in both regimes")
-			},
-		},
-		{
 			name:       "Success - Picker Before Scorer",
 			configText: successPickerBeforeScorerText,
 			wantErr:    false,
@@ -651,8 +526,6 @@ func TestInstantiateAndConfigure(t *testing.T) {
 				require.Equal(t, uint64(1024), cfg.FlowControlConfig.Registry.MaxBytes, "MaxBytes should match yaml")
 				require.NotNil(t, cfg.FlowControlConfig.Controller, "Controller config should be present")
 				require.Equal(t, 1*time.Minute, cfg.FlowControlConfig.Controller.DefaultRequestTTL, "DefaultRequestTTL should match yaml")
-				require.Equal(t, 5*time.Minute, cfg.FlowControlConfig.Controller.NoEndpointRequestTTL,
-					"NoEndpointRequestTTL should match yaml")
 				require.Equal(t, 1*time.Second, cfg.FlowControlConfig.Controller.ExpiryCleanupInterval, "ExpiryCleanupInterval should use default")
 
 				// Verify plugins were injected into the Raw Config.
@@ -704,11 +577,6 @@ func TestInstantiateAndConfigure(t *testing.T) {
 				require.NotNil(t, cfg.FlowControlConfig, "FlowControl config should be loaded")
 				require.Contains(t, cfg.FlowControlConfig.Registry.PriorityBands, 100, "Should contain priority band 100")
 				band := cfg.FlowControlConfig.Registry.PriorityBands[100]
-				require.NotNil(t, band.DefaultRequestTTL)
-				require.Equal(t, 5*time.Minute, *band.DefaultRequestTTL)
-				unboundedBand := cfg.FlowControlConfig.Registry.PriorityBands[-1]
-				require.NotNil(t, unboundedBand.DefaultRequestTTL)
-				require.Zero(t, *unboundedBand.DefaultRequestTTL)
 
 				// Verify custom policies.
 				require.Equal(t, "customFCFS", band.OrderingPolicy.TypedName().Name,
@@ -740,15 +608,13 @@ func TestInstantiateAndConfigure(t *testing.T) {
 			validate: func(t *testing.T, handle fwkplugin.Handle, rawCfg *configapi.EndpointPickerConfig, cfg *config.Config) {
 				require.NotNil(t, cfg.ParserRegistry, "Parser registry should be loaded")
 				parsers := cfg.ParserRegistry.Parsers()
-				require.Len(t, parsers, 4, "Should have the three default parsers plus the passthrough fallback")
+				require.Len(t, parsers, 3, "Should have three default parsers")
 				require.Equal(t, "openai-parser", parsers[0].TypedName().Name)
 				require.Equal(t, openai.OpenAIParserType, parsers[0].TypedName().Type)
 				require.Equal(t, "anthropic-parser", parsers[1].TypedName().Name)
 				require.Equal(t, anthropic.AnthropicParserType, parsers[1].TypedName().Type)
 				require.Equal(t, "vllmhttp-parser", parsers[2].TypedName().Name)
 				require.Equal(t, vllmhttp.VllmHTTPParserType, parsers[2].TypedName().Type)
-				require.Equal(t, passthrough.PassthroughParserType, parsers[3].TypedName().Type,
-					"Passthrough is last so it does not shadow the claimed parsers")
 			},
 		},
 		{
@@ -775,18 +641,25 @@ func TestInstantiateAndConfigure(t *testing.T) {
 				require.Equal(t, "secondParser", parsers[1].TypedName().Name, "Second parser should be secondParser")
 			},
 		},
+
 		{
-			name:       "Success - Explicit parsers keep their own fallback",
-			configText: successExplicitPassthroughConfigText,
+			name:       "Success - Deprecated Top-level SaturationDetector",
+			configText: successDeprecatedTopLevelSaturationDetectorText,
 			wantErr:    false,
 			validate: func(t *testing.T, handle fwkplugin.Handle, rawCfg *configapi.EndpointPickerConfig, cfg *config.Config) {
-				require.NotNil(t, cfg.ParserRegistry, "Parser registry should be loaded")
+				require.NotNil(t, cfg.SaturationDetector, "SaturationDetector should be loaded")
+				require.Equal(t, "utilization-detector", cfg.SaturationDetector.TypedName().Name)
+			},
+		},
+		{
+			name:       "Success - Deprecated Top-level Parser",
+			configText: successDeprecatedTopLevelParserText,
+			wantErr:    false,
+			validate: func(t *testing.T, handle fwkplugin.Handle, rawCfg *configapi.EndpointPickerConfig, cfg *config.Config) {
+				require.NotNil(t, cfg.ParserRegistry, "ParserRegistry should be loaded")
 				parsers := cfg.ParserRegistry.Parsers()
-				require.Len(t, parsers, 2, "Explicit parsers are used as given")
+				require.Len(t, parsers, 1, "Should have one parser")
 				require.Equal(t, "openai-parser", parsers[0].TypedName().Name)
-				require.Equal(t, "myFallback", parsers[1].TypedName().Name,
-					"The operator's own fallback is kept, under its own name")
-				require.Equal(t, passthrough.PassthroughParserType, parsers[1].TypedName().Type)
 			},
 		},
 		// --- Instantiation Errors ---
@@ -1061,34 +934,6 @@ func TestBuildDataLayerConfigEmptySourcesWarning(t *testing.T) {
 	require.Empty(t, cfg.Sources)
 }
 
-func TestBuildDataLayerConfigCrossReplicaPublishTimeout(t *testing.T) {
-	t.Parallel()
-	handle := testutils.NewTestHandle(context.Background())
-	timeout := 3 * time.Second
-	cfg, err := buildDataLayerConfig(
-		&configapi.DataLayerConfig{
-			CrossReplicaPublishTimeout: &metav1.Duration{Duration: timeout},
-		},
-		handle,
-	)
-	require.NoError(t, err)
-	require.Equal(t, timeout, cfg.PublishTimeout)
-}
-
-func TestBuildDataLayerConfigRejectsNonPositiveCrossReplicaPublishTimeout(t *testing.T) {
-	t.Parallel()
-	handle := testutils.NewTestHandle(context.Background())
-	for _, timeout := range []time.Duration{0, -time.Second} {
-		_, err := buildDataLayerConfig(
-			&configapi.DataLayerConfig{
-				CrossReplicaPublishTimeout: &metav1.Duration{Duration: timeout},
-			},
-			handle,
-		)
-		require.ErrorContains(t, err, "crossReplicaPublishTimeout must be positive")
-	}
-}
-
 // --- Helpers & Mocks ---
 
 func hasPluginType(handle fwkplugin.Handle, typeName string) bool {
@@ -1270,9 +1115,6 @@ func registerTestPlugins(t *testing.T) {
 		return &mockHandler{mockPlugin{t: fwkplugin.TypedName{Name: name, Type: testProfileHandler}}}, nil
 	})
 
-	fwkplugin.RegisterWithPluginDependencies(composite.MaxSaturationDetectorType, fwkplugin.StabilityStable,
-		composite.MaxSaturationDetectorFactory, composite.MaxSaturationDetectorConfigParser)
-
 	fwkplugin.RegisterWithPluginDependencies(testWithDependencies, fwkplugin.StabilityStable,
 		func(name string, decoder *json.Decoder, handle fwkplugin.Handle) (fwkplugin.Plugin, error) {
 			rawCfg, err := mockWithDependenciesConfigParser(decoder, handle)
@@ -1347,7 +1189,6 @@ func registerTestPlugins(t *testing.T) {
 	fwkplugin.Register(vertexai.VertexAIParserType, fwkplugin.StabilityStable, vertexai.VertexAIParserPluginFactory)
 	fwkplugin.Register(anthropic.AnthropicParserType, fwkplugin.StabilityStable, anthropic.AnthropicParserPluginFactory)
 	fwkplugin.Register(vllmhttp.VllmHTTPParserType, fwkplugin.StabilityStable, vllmhttp.VllmHTTPParserPluginFactory)
-	fwkplugin.Register(passthrough.PassthroughParserType, fwkplugin.StabilityBeta, passthrough.PassthroughParserPluginFactory)
 	fwkplugin.Register(usagelimits.StaticUsageLimitPolicyType, fwkplugin.StabilityStable, usagelimits.StaticPolicyFactory)
 	fwkplugin.Register(prefix.PrefixCacheScorerPluginType, fwkplugin.StabilityStable, prefix.PrefixCachePluginFactory)
 	fwkplugin.Register(reqdataprodprefix.ApproxPrefixCachePluginType, fwkplugin.StabilityStable, reqdataprodprefix.ApproxPrefixCacheFactory)

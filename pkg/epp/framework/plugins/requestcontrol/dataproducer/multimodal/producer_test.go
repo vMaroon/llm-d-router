@@ -55,17 +55,15 @@ func TestFactory(t *testing.T) {
 	require.Error(t, err)
 }
 
-func TestExtractMMItemsFromTokenizedRequest(t *testing.T) {
+func TestExtractMMItemsFromTokenizedPrompt(t *testing.T) {
 	items := ExtractMMItems(&scheduling.InferenceRequest{
 		Body: &fwkrh.InferenceRequestBody{
-			TokenizedRequest: &fwkrh.TokenizedRequest{
-				Prompts: []fwkrh.PromptTokens{{
-					MultiModalFeatures: []fwkrh.MultiModalFeature{
-						{Modality: fwkrh.ModalityImage, Hash: "image-a", Length: 576},
-						{Modality: fwkrh.ModalityImage, Hash: "image-b", Length: 0},
-						{Modality: fwkrh.ModalityImage, Hash: "image-a", Length: 144},
-					},
-				}},
+			TokenizedPrompt: &fwkrh.TokenizedPrompt{
+				MultiModalFeatures: []fwkrh.MultiModalFeature{
+					{Modality: fwkrh.ModalityImage, Hash: "image-a", Length: 576},
+					{Modality: fwkrh.ModalityImage, Hash: "image-b", Length: 0},
+					{Modality: fwkrh.ModalityImage, Hash: "image-a", Length: 144},
+				},
 			},
 		},
 	})
@@ -76,7 +74,7 @@ func TestExtractMMItemsFromTokenizedRequest(t *testing.T) {
 	}, items)
 }
 
-func TestExtractMMItemsNilTokenizedRequestReturnsNil(t *testing.T) {
+func TestExtractMMItemsNilTokenizedPromptReturnsNil(t *testing.T) {
 	items := ExtractMMItems(&scheduling.InferenceRequest{
 		Body: &fwkrh.InferenceRequestBody{},
 	})
@@ -86,7 +84,7 @@ func TestExtractMMItemsNilTokenizedRequestReturnsNil(t *testing.T) {
 func TestExtractMMItemsEmptyMultiModalFeaturesReturnsNil(t *testing.T) {
 	items := ExtractMMItems(&scheduling.InferenceRequest{
 		Body: &fwkrh.InferenceRequestBody{
-			TokenizedRequest: &fwkrh.TokenizedRequest{},
+			TokenizedPrompt: &fwkrh.TokenizedPrompt{},
 		},
 	})
 	assert.Nil(t, items)
@@ -212,9 +210,8 @@ func TestExtractEndpointRemovesDeletedPod(t *testing.T) {
 }
 
 type testHandle struct {
-	ctx                context.Context
-	podList            func() []k8stypes.NamespacedName
-	crossReplicaSyncer plugin.Plugin
+	ctx     context.Context
+	podList func() []k8stypes.NamespacedName
 }
 
 func (h *testHandle) Context() context.Context {
@@ -237,14 +234,6 @@ func (h *testHandle) GetAllPluginsWithNames() map[string]plugin.Plugin {
 
 func (h *testHandle) Metrics() plugin.MetricsRecorder {
 	return nil
-}
-
-func (h *testHandle) CrossReplicaSyncer() plugin.Plugin {
-	return h.crossReplicaSyncer
-}
-
-func (h *testHandle) SetCrossReplicaSyncer(syncer plugin.Plugin) {
-	h.crossReplicaSyncer = syncer
 }
 
 func (h *testHandle) PodList() []k8stypes.NamespacedName {
@@ -279,7 +268,7 @@ func requestWithHashes(requestID string, hashToWeight map[string]int) *schedulin
 	return &scheduling.InferenceRequest{
 		RequestID: requestID,
 		Body: &fwkrh.InferenceRequestBody{
-			TokenizedRequest: &fwkrh.TokenizedRequest{Prompts: []fwkrh.PromptTokens{{MultiModalFeatures: features}}},
+			TokenizedPrompt: &fwkrh.TokenizedPrompt{MultiModalFeatures: features},
 		},
 	}
 }

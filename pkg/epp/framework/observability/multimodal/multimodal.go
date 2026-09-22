@@ -67,12 +67,8 @@ func Summary(req *scheduling.InferenceRequest) (modality string, hashCount int) 
 }
 
 func requestMMFeatures(req *scheduling.InferenceRequest) []fwkrh.MultiModalFeature {
-	if req == nil || req.Body == nil || req.Body.TokenizedRequest == nil {
+	if req == nil || req.Body == nil || req.Body.TokenizedPrompt == nil {
 		return nil
 	}
-	var features []fwkrh.MultiModalFeature
-	for _, p := range req.Body.TokenizedRequest.Prompts {
-		features = append(features, p.MultiModalFeatures...)
-	}
-	return features
+	return req.Body.TokenizedPrompt.MultiModalFeatures
 }

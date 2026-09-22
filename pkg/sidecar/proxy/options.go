@@ -18,7 +18,6 @@ package proxy
 
 import (
 	"context"
-	"crypto/tls"
 	"errors"
 	"flag"
 	"fmt"
@@ -33,6 +32,8 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/spf13/pflag"
+	uberzap "go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	logutil "github.com/llm-d/llm-d-router/pkg/common/observability/logging"
@@ -67,8 +68,6 @@ const (
 	enablePrefillerSampling   = "enable-prefiller-sampling"
 	enableTLS                 = "enable-tls"
 	tlsInsecureSkipVerify     = "tls-insecure-skip-verify"
-	tlsMinVersion             = "tls-min-version"
-	tlsCipherSuites           = "tls-cipher-suites"
 	secureServing             = "secure-proxy"
 	certPath                  = "cert-path"
 	inferencePool             = "inference-pool"
@@ -81,7 +80,6 @@ const (
 	configurationFile         = "configuration-file"
 	tracingFlag               = "tracing"
 	metricsPort               = "metrics-port"
-	metricsCertDir            = "metrics-cert-dir"
 
 	// Environment variables
 	envInferencePool           = "INFERENCE_POOL"
@@ -97,7 +95,7 @@ const (
 	defaultP2PConnectorPort      = 7777
 
 	// defaultMoRIIOParallelDecodeWaitTimeout backstops the parallel WRITE
-	// dispatch: it bounds how long the decode request waits on the prefill outcome
+	// dispatch: it bounds how long the decode leg waits on the prefill outcome
 	// (and thus KV) before being cancelled, so a hung/failed prefill fails the
 	// request instead of hanging. Prefill in parallel dispatch is capped to one
 	// token, so it normally resolves well within this window.
@@ -126,8 +124,6 @@ type yamlConfiguration struct {
 	CertPath                string   `json:"cert-path,omitempty"`
 	EnableTLS               []string `json:"enable-tls,omitempty"`
 	TLSInsecureSkipVerify   []string `json:"tls-insecure-skip-verify,omitempty"`
-	TLSMinVersion           string   `json:"tls-min-version,omitempty"`
-	TLSCipherSuites         []string `json:"tls-cipher-suites,omitempty"`
 	InferencePool           string   `json:"inference-pool,omitempty"`
 	PoolGroup               string   `json:"pool-group,omitempty"`
 	MaxIdleConnsPerHost     int      `json:"max-idle-conns-per-host,omitempty"`
@@ -136,7 +132,6 @@ type yamlConfiguration struct {
 	DecodeChunkSize         int      `json:"decode-chunk-size,omitempty"`
 	Tracing                 *bool    `json:"tracing,omitempty"`
 	MetricsPort             int      `json:"metrics-port,omitempty"`
-	MetricsCertDir          string   `json:"metrics-cert-dir,omitempty"`
 }
 
 // Options holds the CLI-facing configuration for the pd-sidecar proxy.
@@ -156,8 +151,6 @@ type Options struct {
 	enableTLS []string
 	// tlsInsecureSkipVerify is the list of stages to skip TLS verification for; used to compute Config.InsecureSkipVerifyFor* in Complete().
 	tlsInsecureSkipVerify []string
-	tlsMinVersion         string
-	tlsCipherSuites       []string
 	// inferencePool in namespace/name or name format; used to compute Config.InferencePoolNamespace/Name in Complete().
 	inferencePool string
 
@@ -279,7 +272,7 @@ func (opts *Options) AddFlags(fs *pflag.FlagSet) {
 	fs.IntVar(&opts.MooncakeBootstrapPort, mooncakeBootstrapPortFlag, opts.MooncakeBootstrapPort,
 		"the port used to query the Mooncake bootstrap endpoint on prefill pods (only used with --kv-connector=mooncake)")
 	fs.IntVar(&opts.P2PConnectorPort, p2pConnectorPortFlag, opts.P2PConnectorPort,
-		"the prefiller's OffloadingConnector P2P tier listening port, injected as remote_port on the decode request; with --data-parallel-size > 1 this is the rank-0 port and rank r uses port+r (used with --kv-connector=offloading or --enable-p2p-pull)")
+		"the prefiller's OffloadingConnector P2P tier listening port, injected as remote_port on the decode leg; with --data-parallel-size > 1 this is the rank-0 port and rank r uses port+r (used with --kv-connector=offloading or --enable-p2p-pull)")
 	fs.BoolVar(&opts.EnableP2PPull, enableP2PPull, opts.EnableP2PPull,
 		"declare the OffloadingConnector P2P tier available for cached-prefix pulls when the PD connector is NIXL, i.e. engines run MultiConnector(NixlConnector + OffloadingConnector). Rejected with any other --kv-connector; offloading provides the tier natively without this flag.")
 	fs.BoolVar(&opts.SecureServing, secureServing, opts.SecureServing, "Enables secure proxy. Defaults to true.")
@@ -290,7 +283,6 @@ func (opts *Options) AddFlags(fs *pflag.FlagSet) {
 	fs.IntVar(&opts.DecodeChunkSize, decodeChunkSize, opts.DecodeChunkSize, "enables chunked decode mode when > 0; value is the token budget per chunk. For best performance should be a multiple of the block size.")
 	fs.BoolVar(&opts.Tracing, tracingFlag, opts.Tracing, "Enable OpenTelemetry tracing")
 	fs.IntVar(&opts.MetricsPort, metricsPort, opts.MetricsPort, "Port for the Prometheus /metrics endpoint (exposes the moriio_dns_* counters). 0 (the default) disables it. Takes precedence over the MORIIO_METRICS_ADDR env var.")
-	fs.StringVar(&opts.MetricsCertDir, metricsCertDir, opts.MetricsCertDir, "Directory with tls.crt and tls.key for the metrics endpoint. Empty (the default) serves metrics over plain HTTP. Independent of --secure-proxy/--cert-path, which apply to the data-plane listener.")
 
 	// MoRI-IO WRITE-mode flags. Only meaningful with --kv-connector=nixlv2
 	// against vLLM engines running MoRI-IO in WRITE mode.
@@ -299,7 +291,7 @@ func (opts *Options) AddFlags(fs *pflag.FlagSet) {
 	fs.IntVar(&opts.MoRIIODecodeNotifyPort, "moriio-decode-notify-port", opts.MoRIIODecodeNotifyPort,
 		"Base MoRI-IO notify port on the decode pod.")
 	fs.StringVar(&opts.MoRIIODecodePodIP, "moriio-local-pod-ip", opts.MoRIIODecodePodIP,
-		"Decode pod's routable address, used as the prefill request's remote_host. "+
+		"Decode pod's routable address, used as the prefill leg's remote_host. "+
 			"A Kubernetes DNS name (e.g., 'pod-name.namespace.svc.cluster.local') "+
 			"is resolved to an IP at startup; a literal IP is used as-is. "+
 			"Defaults to the POD_IP env var. Required with --moriio-write-mode.")
@@ -313,18 +305,18 @@ func (opts *Options) AddFlags(fs *pflag.FlagSet) {
 	fs.DurationVar(&opts.MoRIIOParallelDecodeWaitTimeout, "moriio-parallel-decode-wait-timeout", opts.MoRIIOParallelDecodeWaitTimeout,
 		"Backstop timeout for parallel dispatch: how long decode may wait on the prefill outcome/KV before being cancelled so the request fails instead of hanging. Only used with --moriio-parallel-dispatch.")
 	fs.IntVar(&opts.MoRIIOPrefillHandshakePort, "moriio-prefill-handshake-port", opts.MoRIIOPrefillHandshakePort,
-		"Prefill pod's base MoRI-IO handshake port, used to build the decode request in parallel-dispatch mode.")
+		"Prefill pod's base MoRI-IO handshake port, used to build the decode leg in parallel-dispatch mode.")
 	fs.IntVar(&opts.MoRIIOPrefillNotifyPort, "moriio-prefill-notify-port", opts.MoRIIOPrefillNotifyPort,
 		"Prefill pod's base MoRI-IO notify port.")
 	fs.IntVar(&opts.MoRIIOTPSize, "moriio-tp-size", opts.MoRIIOTPSize,
 		"Tensor-parallel size of the engines, echoed into kv_transfer_params[tp_size].")
 	fs.IntVar(&opts.MoRIIODPSize, "moriio-dp-size", opts.MoRIIODPSize,
-		"Data-parallel world size, emitted as kv_transfer_params[remote_dp_size] on both requests. "+
+		"Data-parallel world size, emitted as kv_transfer_params[remote_dp_size] on both legs. "+
 			"Set to the engine DP size for Wide-EP (TP=1, DP>1); default 1 leaves the wire unchanged.")
 
 	// Wide-EP multi-pod fan-out. Optional: empty preserves single-pod behaviour.
 	// remote_hosts carries the opposite side's pod DNS names (decode on the prefill
-	// request and vice versa); dp-size-local maps a global DP rank to a pod via
+	// leg and vice versa); dp-size-local maps a global DP rank to a pod via
 	// pod_idx = dp_rank / dp_size_local.
 	// DNS names are resolved to IPs at startup (LWS-compatible).
 	fs.StringSliceVar(&opts.MoRIIORemoteHosts, "moriio-remote-hosts", opts.MoRIIORemoteHosts,
@@ -336,17 +328,13 @@ func (opts *Options) AddFlags(fs *pflag.FlagSet) {
 		"Wide-EP: per-pod DP size used to map a global DP rank to a pod index. "+
 			"Must satisfy --moriio-dp-size = dp-size-local * len(hosts).")
 	fs.StringSliceVar(&opts.MoRIIODecodeHosts, "moriio-decode-hosts", opts.MoRIIODecodeHosts,
-		"Wide-EP: comma-separated decode-side pod hosts, emitted as the prefill request's "+
+		"Wide-EP: comma-separated decode-side pod hosts, emitted as the prefill leg's "+
 			"remote_hosts. Kubernetes DNS names (e.g., 'pod-name.namespace.svc.cluster.local') "+
 			"are resolved to IPs at startup; literal IPs are used as-is. "+
 			"Pair with --moriio-dp-size-local.")
 
 	fs.StringSliceVar(&opts.enableTLS, enableTLS, opts.enableTLS, "stages to enable TLS for. Supported: "+supportedTLSStageNamesStr+". Can be specified multiple times or as comma-separated values.")
 	fs.StringSliceVar(&opts.tlsInsecureSkipVerify, tlsInsecureSkipVerify, opts.tlsInsecureSkipVerify, "stages to skip TLS verification for. Supported: "+supportedTLSStageNamesStr+". Can be specified multiple times or as comma-separated values.")
-	fs.StringVar(&opts.tlsMinVersion, tlsMinVersion, opts.tlsMinVersion,
-		"minimum TLS version for secure proxy (e.g., VersionTLS12, VersionTLS13)")
-	fs.StringSliceVar(&opts.tlsCipherSuites, tlsCipherSuites, opts.tlsCipherSuites,
-		"comma-separated list of TLS cipher suites for secure proxy (Go crypto/tls names, e.g., TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256). Only effective for TLS 1.2 and below; TLS 1.3 cipher suites are not configurable")
 	fs.StringVar(&opts.inferencePool, inferencePool, opts.inferencePool, "InferencePool in namespace/name or name format (e.g., default/my-pool or my-pool). A single name implies the 'default' namespace. Can also use INFERENCE_POOL env var.")
 
 	fs.IntVar(&opts.MaxIdleConnsPerHost, "max-idle-conns-per-host", opts.MaxIdleConnsPerHost, "max idle keep-alive connections per host for reverse proxy transports; set to at least the expected concurrency")
@@ -364,44 +352,6 @@ func validateStages(stages []string, supportedStages map[string]struct{}, flagNa
 		}
 	}
 	return nil
-}
-
-var tlsVersions = map[string]uint16{
-	"VersionTLS10": tls.VersionTLS10,
-	"VersionTLS11": tls.VersionTLS11,
-	"VersionTLS12": tls.VersionTLS12,
-	"VersionTLS13": tls.VersionTLS13,
-}
-
-func parseTLSVersion(version string) (uint16, error) {
-	if value, ok := tlsVersions[version]; ok {
-		return value, nil
-	}
-	return 0, fmt.Errorf("unknown TLS version %q; supported values: VersionTLS10, VersionTLS11, VersionTLS12, VersionTLS13", version)
-}
-
-func parseCipherSuites(names []string) ([]uint16, error) {
-	byName := make(map[string]uint16)
-	for _, cipherSuite := range tls.CipherSuites() {
-		byName[cipherSuite.Name] = cipherSuite.ID
-	}
-	for _, cipherSuite := range tls.InsecureCipherSuites() {
-		byName[cipherSuite.Name] = cipherSuite.ID
-	}
-
-	values := make([]uint16, 0, len(names))
-	for _, name := range names {
-		name = strings.TrimSpace(name)
-		if name == "" {
-			continue
-		}
-		value, ok := byName[name]
-		if !ok {
-			return nil, fmt.Errorf("unknown cipher suite %q", name)
-		}
-		values = append(values, value)
-	}
-	return values, nil
 }
 
 // Complete performs post-processing of parsed command-line arguments.
@@ -439,20 +389,6 @@ func (opts *Options) Complete() error {
 	opts.InsecureSkipVerifyForPrefiller = slices.Contains(opts.tlsInsecureSkipVerify, prefillStage)
 	opts.InsecureSkipVerifyForEncoder = slices.Contains(opts.tlsInsecureSkipVerify, encodeStage)
 	opts.InsecureSkipVerifyForDecoder = slices.Contains(opts.tlsInsecureSkipVerify, decodeStage)
-	if opts.tlsMinVersion != "" {
-		version, err := parseTLSVersion(opts.tlsMinVersion)
-		if err != nil {
-			return fmt.Errorf("invalid %s %q: %w", tlsMinVersion, opts.tlsMinVersion, err)
-		}
-		opts.TLSMinVersion = version
-	}
-	if len(opts.tlsCipherSuites) > 0 {
-		suites, err := parseCipherSuites(opts.tlsCipherSuites)
-		if err != nil {
-			return fmt.Errorf("invalid %s: %w", tlsCipherSuites, err)
-		}
-		opts.TLSCipherSuites = suites
-	}
 
 	// Compute Config.DecoderURL from modelServerPort and decoder TLS setting
 	scheme := "http"
@@ -491,7 +427,7 @@ func (opts *Options) Complete() error {
 		return errors.New("--moriio-parallel-dispatch requires --moriio-write-mode")
 	}
 
-	// Both requests share the same dp_size / dp_size_local contract; only the host
+	// Both legs share the same dp_size / dp_size_local contract; only the host
 	// list differs.
 	if err := validateWideEPHosts(
 		"--moriio-remote-hosts", opts.MoRIIORemoteHosts,
@@ -529,7 +465,7 @@ func (opts *Options) Complete() error {
 	opts.MoRIIODecodeHosts = resolvedDecode
 
 	// Single-host counterpart: --moriio-local-pod-ip is decode's advertised
-	// remote_host on the prefill request. Resolve it the same way so it can be an
+	// remote_host on the prefill leg. Resolve it the same way so it can be an
 	// LWS DNS name (a literal IP passes through unchanged).
 	if opts.MoRIIODecodePodIP != "" {
 		resolved, podIPErr := resolveHostsToIPs([]string{opts.MoRIIODecodePodIP})
@@ -757,12 +693,38 @@ func validatePortRange(startPort, rangeSize int) error {
 	return nil
 }
 
-// NewLogger returns a logger configured from the Options logging flags with
-// OpenTelemetry field names and severity fields.
+// customLevelEncoder maps negative Zap levels to human-readable names that
+// match the project's verbosity constants (VERBOSE=3, DEBUG=4, TRACE=5).
+// Without this, controller-runtime's zap bridge emits all V(n) calls as
+// "debug" in JSON output, which is misleading for V(1)–V(3) (verbose info).
+func customLevelEncoder(l zapcore.Level, enc zapcore.PrimitiveArrayEncoder) {
+	if l >= 0 {
+		zapcore.LowercaseLevelEncoder(l, enc)
+		return
+	}
+	switch l {
+	case zapcore.Level(-1 * logutil.DEBUG): // V(4) → "debug"
+		enc.AppendString("debug")
+	case zapcore.Level(-1 * logutil.TRACE): // V(5) → "trace"
+		enc.AppendString("trace")
+	default:
+		if l >= zapcore.Level(-1*logutil.VERBOSE) { // V(1)–V(3) → "info"
+			enc.AppendString("info")
+		} else { // V(6+) → "trace"
+			enc.AppendString("trace")
+		}
+	}
+}
+
+// NewLogger returns a logger configured from the Options logging flags,
+// with a custom level encoder that maps verbosity levels to their semantic
+// names instead of always rendering V(n) as "debug".
 func (opts *Options) NewLogger() logr.Logger {
-	return logutil.NewLoggerWithOptions(
-		"llm-d-router-disagg-sidecar",
-		&opts.loggingOptions,
+	config := uberzap.NewProductionEncoderConfig()
+	config.EncodeLevel = customLevelEncoder
+	return zap.New(
+		zap.UseFlagOptions(&opts.loggingOptions),
+		zap.Encoder(zapcore.NewJSONEncoder(config)),
 	)
 }
 
@@ -856,12 +818,6 @@ func (opts *Options) mergeYAMLConfiguration(cfg yamlConfiguration) {
 	if len(cfg.TLSInsecureSkipVerify) > 0 && !opts.isFlagSet(tlsInsecureSkipVerify) {
 		opts.tlsInsecureSkipVerify = cfg.TLSInsecureSkipVerify
 	}
-	if cfg.TLSMinVersion != "" && !opts.isFlagSet(tlsMinVersion) {
-		opts.tlsMinVersion = cfg.TLSMinVersion
-	}
-	if len(cfg.TLSCipherSuites) > 0 && !opts.isFlagSet(tlsCipherSuites) {
-		opts.tlsCipherSuites = cfg.TLSCipherSuites
-	}
 
 	if cfg.InferencePool != "" && !opts.isFlagSet(inferencePool) {
 		opts.inferencePool = cfg.InferencePool
@@ -886,9 +842,6 @@ func (opts *Options) mergeYAMLConfiguration(cfg yamlConfiguration) {
 	}
 	if cfg.MetricsPort != 0 && !opts.isFlagSet(metricsPort) {
 		opts.MetricsPort = cfg.MetricsPort
-	}
-	if cfg.MetricsCertDir != "" && !opts.isFlagSet(metricsCertDir) {
-		opts.MetricsCertDir = cfg.MetricsCertDir
 	}
 	if cfg.Tracing != nil && !opts.isFlagSet(tracingFlag) {
 		opts.Tracing = *cfg.Tracing

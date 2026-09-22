@@ -1,5 +1,5 @@
 /*
-Copyright 2025 The llm-d Authors.
+Copyright 2025 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,7 +17,6 @@ limitations under the License.
 package anthropic
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -29,8 +28,6 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/common/request"
 	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
-	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requesthandling/parsers"
-	parserutil "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requesthandling/parsers/util"
 )
 
 const (
@@ -49,7 +46,6 @@ const (
 var (
 	_ fwkrh.Parser            = &AnthropicParser{}
 	_ fwkrh.ModelNameRewriter = &AnthropicParser{}
-	_ fwkrh.PriorityRewriter  = &AnthropicParser{}
 )
 
 type AnthropicParser struct {
@@ -71,7 +67,7 @@ func (p *AnthropicParser) TypedName() fwkplugin.TypedName {
 
 func (p *AnthropicParser) Claims() fwkrh.Claims {
 	return fwkrh.Claims{
-		Paths:     []string{messagesAPI, countTokensAPI, messagesAPI + "/render"},
+		Paths:     []string{messagesAPI, countTokensAPI},
 		Protocols: []v1.AppProtocol{v1.AppProtocolH2C, v1.AppProtocolHTTP},
 	}
 }
@@ -87,11 +83,9 @@ func (p *AnthropicParser) WithName(name string) *AnthropicParser {
 
 func (p *AnthropicParser) ParseRequest(_ context.Context, body []byte, headers map[string]string) (*fwkrh.ParseResult, error) {
 	path := request.GetRequestPath(headers)
-	if request.MatchPathSuffix(path, messagesAPI+"/render") {
-		return parserutil.ParseRenderRequest(body)
-	}
 
-	// count_tokens delegates token counting to the server and passes its response through.
+	// The count_tokens endpoint returns only a token count and gains nothing from
+	// structured parsing or response interception; forward the body unchanged.
 	if strings.HasSuffix(path, "/"+countTokensAPI) {
 		return &fwkrh.ParseResult{
 			Body:                   &fwkrh.InferenceRequestBody{Payload: fwkrh.RawPayload(body)},
@@ -103,8 +97,8 @@ func (p *AnthropicParser) ParseRequest(_ context.Context, body []byte, headers m
 		return nil, fmt.Errorf("unsupported API endpoint: %s", path)
 	}
 
-	bodyMap, err := parserutil.UnmarshalEnvelope(body, "system")
-	if err != nil {
+	bodyMap := make(map[string]any)
+	if err := json.Unmarshal(body, &bodyMap); err != nil {
 		return nil, fmt.Errorf("error unmarshaling request body: %w", err)
 	}
 
@@ -119,7 +113,6 @@ func (p *AnthropicParser) ParseRequest(_ context.Context, body []byte, headers m
 	result := &fwkrh.InferenceRequestBody{
 		Messages:        &messagesReq,
 		Payload:         fwkrh.PayloadMap(bodyMap),
-		RawBody:         body,
 		MaxOutputTokens: fwkrh.MaxOutputTokensFromPayload(bodyMap, "max_tokens"),
 	}
 	if model, ok := bodyMap["model"].(string); ok {
@@ -140,14 +133,6 @@ func (p *AnthropicParser) RewriteModelName(payload fwkrh.MarshalablePayload, mod
 	}
 	m["model"] = model
 	return m, nil
-}
-
-// RewritePriority removes any client-supplied priority from the Anthropic
-// messages payload and writes the resolved EPP priority. The director only calls
-// this when priority propagation is enabled; see parsers.RewritePriority for the
-// cross-backend priority semantics.
-func (p *AnthropicParser) RewritePriority(ctx fwkrh.PriorityRewriteContext, payload fwkrh.MarshalablePayload, priority int) (fwkrh.MarshalablePayload, bool, error) {
-	return parsers.RewritePriority(ctx, payload, priority)
 }
 
 func (p *AnthropicParser) ParseResponse(_ context.Context, body []byte, headers map[string]string, _ bool) (*fwkrh.ParsedResponse, error) {
@@ -213,20 +198,19 @@ func extractUsage(responseBytes []byte) (*fwkrh.Usage, error) {
 //	event: message_stop
 //	data: {"type":"message_stop"}
 func (p *AnthropicParser) parseStreamResponse(chunk []byte) (*fwkrh.ParsedResponse, error) {
-	usage := extractUsageStreaming(chunk)
+	usage := extractUsageStreaming(string(chunk))
 	return &fwkrh.ParsedResponse{Usage: usage}, nil
 }
 
-func extractUsageStreaming(responseBytes []byte) *fwkrh.Usage {
+func extractUsageStreaming(responseText string) *fwkrh.Usage {
 	var result *fwkrh.Usage
 
-	lines := bytes.SplitSeq(responseBytes, []byte("\n"))
-	for line := range lines {
-		content, ok := bytes.CutPrefix(line, []byte(streamingRespPrefix))
-		// Safe because only message_start/message_delta carry usage, both with a literal "usage" key.
-		if !ok || !bytes.Contains(content, []byte("usage")) {
+	lines := strings.Split(responseText, "\n")
+	for _, line := range lines {
+		if !strings.HasPrefix(line, streamingRespPrefix) {
 			continue
 		}
+		content := strings.TrimPrefix(line, streamingRespPrefix)
 
 		var event struct {
 			Type    string `json:"type"`
@@ -235,7 +219,7 @@ func extractUsageStreaming(responseBytes []byte) *fwkrh.Usage {
 			} `json:"message"`
 			Usage map[string]any `json:"usage"`
 		}
-		if err := json.Unmarshal(content, &event); err != nil {
+		if err := json.Unmarshal([]byte(content), &event); err != nil {
 			continue
 		}
 

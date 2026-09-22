@@ -1,5 +1,5 @@
 /*
-Copyright 2026 The llm-d Authors.
+Copyright 2025 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -29,6 +29,9 @@ import (
 	fwkfcmocks "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/flowcontrol/mocks"
 	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/flowcontrol/saturationdetector/concurrency"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/flowcontrol/saturationdetector/utilization"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 // notADetector is a plugin that does not implement flowcontrol.SaturationDetector.
@@ -36,22 +39,6 @@ type notADetector struct{}
 
 func (n *notADetector) TypedName() fwkplugin.TypedName {
 	return fwkplugin.TypedName{Type: "not-a-detector", Name: "not-a-detector"}
-}
-
-// stageRecorder is a saturation detector that records the stage of every evaluation.
-type stageRecorder struct {
-	name       string
-	saturation float64
-	stages     []string
-}
-
-func (r *stageRecorder) TypedName() fwkplugin.TypedName {
-	return fwkplugin.TypedName{Type: "stage-recorder", Name: r.name}
-}
-
-func (r *stageRecorder) Saturation(ctx context.Context, _ []datalayer.Endpoint) float64 {
-	r.stages = append(r.stages, flowcontrol.SaturationStageFromContext(ctx))
-	return r.saturation
 }
 
 func newHandle(t *testing.T) fwkplugin.Handle {
@@ -135,21 +122,6 @@ func TestFactory_Errors(t *testing.T) {
 			wantErr: "duplicate entry",
 		},
 		{
-			name:    "stages entry not in detectors",
-			params:  `{"detectors":["a"],"stages":{"b":["decode"]}}`,
-			wantErr: "stages entry b is not listed in detectors",
-		},
-		{
-			name:    "stages entry without stages",
-			params:  `{"detectors":["a"],"stages":{"a":[]}}`,
-			wantErr: "stages entry a must name at least one stage",
-		},
-		{
-			name:    "unsupported stage",
-			params:  `{"detectors":["a"],"stages":{"a":["encode"]}}`,
-			wantErr: `stages entry a has unsupported stage "encode"`,
-		},
-		{
 			name:    "malformed parameters",
 			params:  `{"detectors":"not-a-list"}`,
 			wantErr: "failed to unmarshal",
@@ -167,47 +139,6 @@ func TestFactory_Errors(t *testing.T) {
 			assert.Contains(t, err.Error(), tt.wantErr)
 		})
 	}
-}
-
-func TestSaturation_StageScopedChildren(t *testing.T) {
-	decodeConcurrency := &stageRecorder{name: "decode-concurrency", saturation: 0.9}
-	prefillQueue := &stageRecorder{name: "prefill-queue", saturation: 0.3}
-	unscoped := &stageRecorder{name: "unscoped", saturation: 0.1}
-	handle := newHandle(t)
-	for _, child := range []*stageRecorder{decodeConcurrency, prefillQueue, unscoped} {
-		handle.AddPlugin(child.name, child)
-	}
-
-	p, err := MaxSaturationDetectorFactory("combined", fwkplugin.StrictDecoder([]byte(
-		`{"detectors":["decode-concurrency","prefill-queue","unscoped"],`+
-			`"stages":{"decode-concurrency":["decode"],"prefill-queue":["prefill"]}}`)), handle)
-	require.NoError(t, err)
-	d := p.(flowcontrol.SaturationDetector)
-
-	prefillCtx := flowcontrol.WithSaturationStage(context.Background(), flowcontrol.SaturationStagePrefill)
-	decodeCtx := flowcontrol.WithSaturationStage(context.Background(), flowcontrol.SaturationStageDecode)
-	assert.InDelta(t, 0.3, d.Saturation(prefillCtx, nil), 1e-9)
-	assert.InDelta(t, 0.9, d.Saturation(decodeCtx, nil), 1e-9)
-	assert.InDelta(t, 0.9, d.Saturation(context.Background(), nil), 1e-9)
-
-	assert.Equal(t, []string{"decode", ""}, decodeConcurrency.stages)
-	assert.Equal(t, []string{"prefill", ""}, prefillQueue.stages)
-	assert.Equal(t, []string{"prefill", "decode", ""}, unscoped.stages)
-}
-
-func TestSaturation_StageWithoutChildrenInScope(t *testing.T) {
-	handle := newHandle(t)
-	handle.AddPlugin("decode-concurrency", mockDetector("decode-concurrency", 1.2))
-
-	p, err := MaxSaturationDetectorFactory("combined", fwkplugin.StrictDecoder([]byte(
-		`{"detectors":["decode-concurrency"],"stages":{"decode-concurrency":["decode"]}}`)), handle)
-	require.NoError(t, err)
-	d := p.(flowcontrol.SaturationDetector)
-
-	prefillCtx := flowcontrol.WithSaturationStage(context.Background(), flowcontrol.SaturationStagePrefill)
-	assert.InDelta(t, 0.0, d.Saturation(prefillCtx, nil), 1e-9, "a stage with no child in scope must not gate")
-	decodeCtx := flowcontrol.WithSaturationStage(context.Background(), flowcontrol.SaturationStageDecode)
-	assert.InDelta(t, 1.2, d.Saturation(decodeCtx, nil), 1e-9)
 }
 
 func TestFactory_NilHandle(t *testing.T) {
@@ -240,4 +171,66 @@ func TestNotAConsumerOrSchedulingPlugin(t *testing.T) {
 	assert.False(t, isConsumer, "composite must not declare data dependencies of its own")
 	_, isFilter := p.(fwksched.Filter)
 	assert.False(t, isFilter, "composite must not be auto-injected into scheduling profiles as a filter")
+}
+
+func TestFactory_StagesScopeChildren(t *testing.T) {
+	handle := newHandle(t)
+	handle.AddPlugin("queue", mockDetector("queue", 0.9))
+	handle.AddPlugin("concurrency", mockDetector("concurrency", 0.3))
+
+	p, err := MaxSaturationDetectorFactory("split", fwkplugin.StrictDecoder([]byte(
+		`{"detectors":["concurrency","queue"],"stages":{"queue":["prefill"],"concurrency":["decode"]}}`)), handle)
+	require.NoError(t, err)
+	d := p.(flowcontrol.SaturationDetector)
+
+	assert.InDelta(t, 0.9, d.Saturation(flowcontrol.WithSaturationStage(context.Background(), "prefill"), nil), 1e-9)
+	assert.InDelta(t, 0.3, d.Saturation(flowcontrol.WithSaturationStage(context.Background(), "decode"), nil), 1e-9)
+	assert.InDelta(t, 0.9, d.Saturation(context.Background(), nil), 1e-9, "unpartitioned evaluates every child")
+
+	_, err = MaxSaturationDetectorFactory("bad", fwkplugin.StrictDecoder([]byte(
+		`{"detectors":["queue"],"stages":{"concurrency":["decode"]}}`)), handle)
+	require.Error(t, err)
+	_, err = MaxSaturationDetectorFactory("bad", fwkplugin.StrictDecoder([]byte(
+		`{"detectors":["queue"],"stages":{"queue":["encode"]}}`)), handle)
+	require.Error(t, err)
+}
+
+func TestReservationsReachStageScopedChildren(t *testing.T) {
+	handle := newHandle(t)
+	c, err := concurrency.ConcurrencyDetectorFactory("decode-concurrency", fwkplugin.StrictDecoder([]byte(
+		`{"concurrencyMode":"requests","maxConcurrency":2}`)), handle)
+	require.NoError(t, err)
+	handle.AddPlugin("decode-concurrency", c)
+	u, err := utilization.UtilizationDetectorFactory("prefill-queue", fwkplugin.StrictDecoder([]byte(
+		`{"queueDepthThreshold":2,"kvCacheUtilThreshold":1.0}`)), handle)
+	require.NoError(t, err)
+	handle.AddPlugin("prefill-queue", u)
+
+	p, err := MaxSaturationDetectorFactory("admission-split", fwkplugin.StrictDecoder([]byte(
+		`{"detectors":["decode-concurrency","prefill-queue"],"stages":{"decode-concurrency":["decode"],"prefill-queue":["prefill"]}}`)), handle)
+	require.NoError(t, err)
+
+	// Flow control discovers trackers by asserting on the configured detector.
+	var sd flowcontrol.SaturationDetector = p.(flowcontrol.SaturationDetector)
+	tokens, ok := sd.(flowcontrol.TokenDispatchReservationTracker)
+	require.True(t, ok, "processor must see a token reservation tracker through the composite")
+
+	decode := datalayer.NewEndpoint(&datalayer.EndpointMetadata{
+		ID:     types.NamespacedName{Name: "d0", Namespace: "ns"},
+		Labels: map[string]string{"llm-d.ai/role": "decode"},
+	}, nil)
+	ctx := flowcontrol.WithSaturationStage(context.Background(), "decode")
+	endpoints := []datalayer.Endpoint{decode}
+	assert.InDelta(t, 0.0, sd.Saturation(ctx, endpoints), 1e-9)
+
+	require.True(t, tokens.ReserveDispatchTokens("r1", 60000))
+	assert.InDelta(t, 0.5, sd.Saturation(ctx, endpoints), 1e-9, "a dispatched request counts before PreRequest")
+	require.True(t, tokens.ReserveDispatch("r2"))
+	assert.InDelta(t, 1.0, sd.Saturation(ctx, endpoints), 1e-9)
+	assert.False(t, tokens.ReserveDispatch("r2"), "duplicate reservation is rejected")
+
+	require.True(t, tokens.ReleaseDispatch("r1"))
+	require.True(t, tokens.ReleaseDispatch("r2"))
+	assert.False(t, tokens.ReleaseDispatch("r2"), "duplicate release is a no-op")
+	assert.InDelta(t, 0.0, sd.Saturation(ctx, endpoints), 1e-9)
 }

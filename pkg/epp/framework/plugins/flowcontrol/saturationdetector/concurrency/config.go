@@ -1,6 +1,5 @@
 /*
 Copyright 2025 The Kubernetes Authors.
-Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,10 +17,14 @@ limitations under the License.
 package concurrency
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 
 	"k8s.io/utils/ptr"
+
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/filter/bylabel"
 )
 
 // apiConfig represents the external configuration schema for the concurrency detector.
@@ -30,6 +33,9 @@ import (
 //
 // It is designed to be deserialized from JSON via the plugin's raw parameters.
 type apiConfig struct {
+	// DecodeSafety is an optional utilization-detector configuration. Its decode
+	// KV/queue signal floors admission saturation without adding logical and physical KV.
+	DecodeSafety json.RawMessage `json:"decodeSafety,omitempty"`
 	// MaxConcurrency defines the request-based saturation threshold for an endpoint.
 	//
 	// This limit serves as the "ideal" request capacity for a single endpoint. The plugin aggregates
@@ -78,6 +84,10 @@ type apiConfig struct {
 	// Defaults to 1000000 if unset.
 	MaxTokenConcurrency      *int64 `json:"maxTokenConcurrency,omitempty"`
 	InFlightLoadProducerName string `json:"inFlightLoadProducerName,omitempty"`
+	// MaxTokenConcurrencyByRole overrides the token capacity for exact llm-d.ai/role
+	// label values. Unlisted or unlabeled endpoints use MaxTokenConcurrency.
+	// Applies to saturation and filtering; it does not change token accounting.
+	MaxTokenConcurrencyByRole map[string]int64 `json:"maxTokenConcurrencyByRole,omitempty"`
 }
 
 // concurrencyMode is the concurrency detection mode.
@@ -105,11 +115,12 @@ const (
 
 // config is the internal, fully-validated configuration used by the detector.
 type config struct {
-	maxConcurrency           int64
-	headroom                 float64
-	mode                     concurrencyMode
-	maxTokenConcurrency      int64
-	inFlightLoadProducerName string
+	maxConcurrency            int64
+	headroom                  float64
+	mode                      concurrencyMode
+	maxTokenConcurrency       int64
+	maxTokenConcurrencyByRole map[string]int64
+	inFlightLoadProducerName  string
 }
 
 // buildConfig applies the configuration lifecycle (defaulting and validation) and translates the
@@ -128,11 +139,12 @@ func buildConfig(apiCfg *apiConfig) (*config, error) {
 	}
 
 	return &config{
-		maxConcurrency:           *safeCfg.MaxConcurrency,
-		headroom:                 *safeCfg.Headroom,
-		mode:                     *safeCfg.ConcurrencyMode,
-		maxTokenConcurrency:      *safeCfg.MaxTokenConcurrency,
-		inFlightLoadProducerName: safeCfg.InFlightLoadProducerName,
+		maxConcurrency:            *safeCfg.MaxConcurrency,
+		headroom:                  *safeCfg.Headroom,
+		mode:                      *safeCfg.ConcurrencyMode,
+		maxTokenConcurrency:       *safeCfg.MaxTokenConcurrency,
+		maxTokenConcurrencyByRole: maps.Clone(safeCfg.MaxTokenConcurrencyByRole),
+		inFlightLoadProducerName:  safeCfg.InFlightLoadProducerName,
 	}, nil
 }
 
@@ -165,6 +177,18 @@ func validateConfig(cfg *apiConfig) error {
 	}
 	if cfg.MaxTokenConcurrency != nil && *cfg.MaxTokenConcurrency <= 0 {
 		errs = append(errs, fmt.Errorf("maxTokenConcurrency must be strictly positive, got %d", *cfg.MaxTokenConcurrency))
+	}
+	for role, capacity := range cfg.MaxTokenConcurrencyByRole {
+		switch role {
+		case bylabel.RolePrefill, bylabel.RoleDecode, bylabel.RoleEncode,
+			bylabel.RoleEncodePrefill, bylabel.RolePrefillDecode, bylabel.RoleEncodePrefillDecode,
+			bylabel.RoleBoth: //nolint:staticcheck // Match the role filters' legacy alias.
+		default:
+			errs = append(errs, fmt.Errorf("unsupported maxTokenConcurrencyByRole role: %q", role))
+		}
+		if capacity <= 0 {
+			errs = append(errs, fmt.Errorf("maxTokenConcurrencyByRole[%q] must be strictly positive, got %d", role, capacity))
+		}
 	}
 
 	if cfg.ConcurrencyMode != nil {

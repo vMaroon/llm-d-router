@@ -42,14 +42,11 @@ type CostAwareMemoryIndexConfig struct {
 	// Size is the maximum memory size that can be used by the index.
 	// Supports human-readable formats like "2GiB", "500MiB", "1GB", etc.
 	Size string `json:"size,omitempty"`
-	// NumCounters is the number of Ristretto counters used for admission and eviction.
-	NumCounters int64 `json:"numCounters,omitempty"`
 }
 
 func DefaultCostAwareMemoryIndexConfig() *CostAwareMemoryIndexConfig {
 	return &CostAwareMemoryIndexConfig{
-		Size:        "2GiB", // 2GiB default size
-		NumCounters: defaultNumCounters,
+		Size: "2GiB", // 2GiB default size
 	}
 }
 
@@ -63,11 +60,6 @@ func NewCostAwareMemoryIndex(cfg *CostAwareMemoryIndexConfig) (*CostAwareMemoryI
 	sizeBytes, err := humanize.ParseBytes(cfg.Size)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize cost aware index: %w", err)
-	}
-
-	numCounters := cfg.NumCounters
-	if numCounters == 0 {
-		numCounters = defaultNumCounters
 	}
 
 	requestKeys, err := lru.New[BlockHash, []BlockHash](defaultNumCounters)
@@ -87,7 +79,7 @@ func NewCostAwareMemoryIndex(cfg *CostAwareMemoryIndexConfig) (*CostAwareMemoryI
 	// because Add holds mu while blocking in data.Wait(), which is what drains the
 	// buffer that triggers these callbacks; taking mu here would deadlock.
 	cache, err := ristretto.NewCache(&ristretto.Config[string, *CostPodCache]{
-		NumCounters: numCounters,        // number of keys to track.
+		NumCounters: defaultNumCounters, // number of keys to track.
 		MaxCost:     int64(sizeBytes),   // #nosec G115 , maximum cost of cache
 		BufferItems: defaultBufferItems, // number of keys per Get buffer.
 		OnEvict:     index.onCostCacheRemoval,
@@ -292,10 +284,15 @@ func (m *CostAwareMemoryIndex) Lookup(ctx context.Context, requestKeys []BlockHa
 
 	traceLogger := log.FromContext(ctx).V(logging.TRACE).WithName("kvblock.CostAwareMemoryIndex.Lookup")
 
-	podsPerKey := make(map[BlockHash][]PodEntry)
+	podsPerKey := make(map[BlockHash][]PodEntry, len(requestKeys))
 	highestHitIdx := 0
 
 	for idx, key := range requestKeys {
+		if idx&63 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
 		keyStr := key.String()
 		if pods, found := m.data.Get(keyStr); found { //nolint:nestif // TODO: can this be optimized?
 			if pods == nil || pods.Len() == 0 {
@@ -329,8 +326,10 @@ func (m *CostAwareMemoryIndex) Lookup(ctx context.Context, requestKeys []BlockHa
 		}
 	}
 
-	traceLogger.Info("lookup completed", "highest-hit-index", highestHitIdx,
-		"pods-per-key", podsPerKeyPrintHelper(podsPerKey))
+	if traceLogger.Enabled() {
+		traceLogger.Info("lookup completed", "highest-hit-index", highestHitIdx,
+			"pods-per-key", podsPerKeyPrintHelper(podsPerKey))
+	}
 
 	return podsPerKey, nil
 }

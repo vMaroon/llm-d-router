@@ -1,6 +1,5 @@
 /*
 Copyright 2025 The Kubernetes Authors.
-Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -36,20 +35,15 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/epp/metrics"
 )
 
-// occupancyStats holds lock-free aggregated occupancy counters for one aggregation scope: a single priority band, or
-// the registry-wide totals. Each managedQueue applies its measured mutation deltas to its band's counters and the
-// registry totals directly, via pointers captured at construction.
-// The counters never go negative: deltas are measured from queue-reported stats (see managedQueue), and per-queue
-// stats are non-negative by construction. Readers rely on this to cast to uint64.
-type occupancyStats struct {
+// propagateStatsDeltaFunc defines the callback function used to propagate statistics changes (deltas) up the hierarchy
+// (Queue -> Registry).
+// Implementations MUST be non-blocking (relying on atomics).
+type propagateStatsDeltaFunc func(priority int, lenDelta, byteSizeDelta int64)
+
+// bandStats holds the aggregated atomic statistics for a single priority band.
+type bandStats struct {
 	byteSize atomic.Int64
 	len      atomic.Int64
-}
-
-// add applies a measured mutation delta to both counters.
-func (s *occupancyStats) add(lenDelta, byteSizeDelta int64) {
-	s.len.Add(lenDelta)
-	s.byteSize.Add(byteSizeDelta)
 }
 
 // flowState tracks the lifecycle and usage of a specific flow instance.
@@ -101,12 +95,19 @@ type FlowRegistry struct {
 	// priorityBandStates tracks dynamically provisioned bands, keyed by priority (int)
 	priorityBandStates sync.Map // stores `int` -> *priorityBandState
 
-	// totals aggregates occupancy across all priority bands, updated lock-free by every managedQueue.
-	totals occupancyStats
+	// Globally aggregated statistics, updated atomically via lock-free propagation.
+	totalByteSize atomic.Int64
+	totalLen      atomic.Int64
+
+	// perPriorityBandStats tracks aggregated stats per priority.
+	// Key: int (priority), Value: *bandStats
+	// We use sync.Map here to allow for lock-free reads on the hot path (Stats) while allowing dynamic provisioning to
+	// add new keys safely.
+	perPriorityBandStats sync.Map
 
 	// priorityBands is the primary container for all managed queues.
-	// We use sync.Map to allow lock-free lookups on the hot path (CapacitySnapshot) while enabling safe dynamic
-	// addition of new priority bands.
+	// We use sync.Map to allow lock-free lookups on the hot path (Stats/Propagation) while enabling safe dynamic addition
+	// of new priority bands.
 	// Key: int (priority), Value: *priorityBand
 	priorityBands sync.Map
 
@@ -173,6 +174,7 @@ func NewFlowRegistry(config *Config, logger logr.Logger, opts ...RegistryOption)
 
 	for prio, bandConfig := range cfg.PriorityBands {
 		fr.initialPriorities[prio] = struct{}{}
+		fr.perPriorityBandStats.LoadOrStore(prio, &bandStats{})
 		fr.initPriorityBand(bandConfig)
 	}
 
@@ -378,6 +380,8 @@ func (fr *FlowRegistry) provisionPriorityBandLocked(priority int) {
 	newBand.Priority = priority
 	fr.config.PriorityBands[priority] = &newBand
 
+	fr.perPriorityBandStats.LoadOrStore(priority, &bandStats{})
+
 	fr.priorityBandStates.LoadOrStore(priority, &priorityBandState{
 		priority: priority,
 	})
@@ -414,48 +418,37 @@ func (fr *FlowRegistry) isBandProtectedLocked(priority int) bool {
 	return desired
 }
 
-// --- Statistics ---
+// --- `contracts.FlowRegistryObserver` Implementation ---
 
-// CapacitySnapshot implements the contract's admission-path capacity read. Capacities are read without a lock
-// because band configuration and the global limits are immutable once published.
-func (fr *FlowRegistry) CapacitySnapshot(priority int) (contracts.CapacitySnapshot, error) {
-	val, ok := fr.priorityBands.Load(priority)
-	if !ok {
-		return contracts.CapacitySnapshot{}, fmt.Errorf("failed to get capacity snapshot for priority %d: %w",
-			priority, contracts.ErrPriorityBandNotFound)
+// Stats returns globally aggregated statistics for the entire `FlowRegistry`.
+//
+// Statistics are aggregated using high-performance, lock-free atomic updates.
+// The returned stats represent a near-consistent snapshot of the system's state.
+func (fr *FlowRegistry) Stats() contracts.AggregateStats {
+	fr.mu.RLock()
+	defer fr.mu.RUnlock()
+
+	// Casts from `int64` to `uint64` are safe: aggregates are sums of deltas measured from
+	// queue-reported stats (see managedQueue), and per-queue stats are non-negative by construction.
+	stats := contracts.AggregateStats{
+		TotalCapacityBytes:    fr.config.MaxBytes,
+		TotalCapacityRequests: fr.config.MaxRequests,
+		TotalByteSize:         uint64(fr.totalByteSize.Load()),
+		TotalLen:              uint64(fr.totalLen.Load()),
+		PerPriorityBandStats:  make(map[int]contracts.PriorityBandStats, len(fr.config.PriorityBands)),
 	}
-	return contracts.CapacitySnapshot{
-		Band:   val.(*priorityBand).capacityDimension(),
-		Global: fr.globalCapacityDimension(),
-	}, nil
-}
 
-// globalCapacityDimension returns the registry-wide occupancy against the configured global limits.
-func (fr *FlowRegistry) globalCapacityDimension() contracts.CapacityDimension {
-	return contracts.CapacityDimension{
-		Len:              uint64(fr.totals.len.Load()),
-		ByteSize:         uint64(fr.totals.byteSize.Load()),
-		CapacityRequests: fr.config.MaxRequests,
-		CapacityBytes:    fr.config.MaxBytes,
-	}
-}
-
-// AggregateStats is a near-consistent snapshot of occupancy and configured capacities, globally and per priority
-// band.
-type AggregateStats struct {
-	Global          contracts.CapacityDimension
-	PerPriorityBand map[int]contracts.CapacityDimension
-}
-
-// Stats returns an AggregateStats snapshot. It ranges over all bands and allocates the result, so it serves tests
-// and debugging; per-request paths read CapacitySnapshot instead.
-func (fr *FlowRegistry) Stats() AggregateStats {
-	stats := AggregateStats{
-		Global:          fr.globalCapacityDimension(),
-		PerPriorityBand: make(map[int]contracts.CapacityDimension),
-	}
-	fr.priorityBands.Range(func(key, value any) bool {
-		stats.PerPriorityBand[key.(int)] = value.(*priorityBand).capacityDimension()
+	fr.perPriorityBandStats.Range(func(key, value any) bool {
+		priority := key.(int)
+		bandStats := value.(*bandStats)
+		bandCfg := fr.config.PriorityBands[priority]
+		stats.PerPriorityBandStats[priority] = contracts.PriorityBandStats{
+			Priority:         priority,
+			CapacityBytes:    bandCfg.MaxBytes,
+			CapacityRequests: bandCfg.MaxRequests,
+			ByteSize:         uint64(bandStats.byteSize.Load()),
+			Len:              uint64(bandStats.len.Load()),
+		}
 		return true
 	})
 	return stats
@@ -552,6 +545,7 @@ func (fr *FlowRegistry) cleanupPriorityBandResourcesLocked(priority int) {
 	}
 
 	delete(fr.config.PriorityBands, priority)
+	fr.perPriorityBandStats.Delete(priority)
 	fr.priorityBands.Delete(priority)
 
 	// Copy-on-write: the published slice is shared with lock-free readers and must not be mutated.
@@ -573,4 +567,18 @@ func (fr *FlowRegistry) buildFlowComponents(
 		return nil, nil, fmt.Errorf("priority band %d not found: %w", key.Priority, contracts.ErrPriorityBandNotFound)
 	}
 	return bandConfig.OrderingPolicy, queue.New(bandConfig.OrderingPolicy), nil
+}
+
+// propagateStatsDelta is the top-level, lock-free aggregator for all statistics.
+func (fr *FlowRegistry) propagateStatsDelta(priority int, lenDelta, byteSizeDelta int64) {
+	if _, ok := fr.priorityBands.Load(priority); ok {
+
+		if val, ok := fr.perPriorityBandStats.Load(priority); ok {
+			stats := val.(*bandStats)
+			stats.len.Add(lenDelta)
+			stats.byteSize.Add(byteSizeDelta)
+		}
+		fr.totalLen.Add(lenDelta)
+		fr.totalByteSize.Add(byteSizeDelta)
+	}
 }

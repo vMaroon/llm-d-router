@@ -25,14 +25,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/go-logr/logr"
+	"github.com/llm-d/llm-d-router/pkg/common/observability/tracing"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
-
-	"github.com/llm-d/llm-d-router/pkg/common/observability/logging"
-	"github.com/llm-d/llm-d-router/pkg/common/observability/semconv"
-	"github.com/llm-d/llm-d-router/pkg/common/observability/tracing"
-	reqcommon "github.com/llm-d/llm-d-router/pkg/common/request"
 )
 
 const (
@@ -60,11 +56,11 @@ const (
 // dispatchDecode routes a fully-prepared decode request to either chunked
 // decode or the regular decoder proxy. Chunked decode is only used for
 // chat completions requests when s.config.DecodeChunkSize > 0.
-// body is the already-parsed JSON map; callers that hold it
+// completionRequest is the already-parsed JSON map; callers that hold it
 // should use this instead of calling s.decoderProxy directly.
-func (s *Server) dispatchDecode(w http.ResponseWriter, r *http.Request, body map[string]any) {
-	if s.config.DecodeChunkSize > 0 && r.URL.Path == reqcommon.PathChatCompletions {
-		s.runChunkedDecodeFromMap(w, r, body)
+func (s *Server) dispatchDecode(w http.ResponseWriter, r *http.Request, completionRequest map[string]any) {
+	if s.config.DecodeChunkSize > 0 && r.URL.Path == ChatCompletionsPath {
+		s.runChunkedDecodeFromMap(w, r, completionRequest)
 		return
 	}
 	s.decoderProxy.ServeHTTP(w, r)
@@ -73,36 +69,36 @@ func (s *Server) dispatchDecode(w http.ResponseWriter, r *http.Request, body map
 // runChunkedDecode reads and parses the body, then delegates to
 // runChunkedDecodeFromMap.
 func (s *Server) runChunkedDecode(w http.ResponseWriter, r *http.Request) {
-	original, body, ok := s.readJSONBody(r, w)
+	original, completionRequest, ok := s.readJSONBody(r, w)
 	if !ok {
 		return
 	}
 
-	s.runChunkedDecodeFromMap(w, cloneRequestWithBody(r.Context(), r, original), body)
+	s.runChunkedDecodeFromMap(w, cloneRequestWithBody(r.Context(), r, original), completionRequest)
 }
 
-// runChunkedDecodeFromMap executes chunked decode given an already-parsed body map.
+// runChunkedDecodeFromMap executes chunked decode given an already-parsed completionRequest map.
 // Non-streaming: accumulated chunks are reassembled into a single JSON response.
 // Streaming: each chunk is re-emitted as an SSE event; [DONE] closes the stream.
-func (s *Server) runChunkedDecodeFromMap(w http.ResponseWriter, r *http.Request, body map[string]any) {
-	s.logger.V(logging.DEBUG).Info("running chunked decode", "chunkSize", s.config.DecodeChunkSize)
+func (s *Server) runChunkedDecodeFromMap(w http.ResponseWriter, r *http.Request, completionRequest map[string]any) {
+	s.logger.V(4).Info("running chunked decode", "chunkSize", s.config.DecodeChunkSize)
 
 	ctx, span := tracing.Tracer(tracerScope).Start(r.Context(), "chunked_decode",
 		trace.WithSpanKind(trace.SpanKindInternal),
 	)
 	defer span.End()
 
-	streamingEnabled, _ := body[requestFieldStream].(bool)
-	originalMaxTokens := resolveMaxTokens(body)
+	streamingEnabled, _ := completionRequest[requestFieldStream].(bool)
+	originalMaxTokens := resolveMaxTokens(completionRequest)
 
 	span.SetAttributes(
-		semconv.LLMDPDProxyChunkedDecodeChunkSize(s.config.DecodeChunkSize),
-		semconv.LLMDPDProxyChunkedDecodeStreaming(streamingEnabled),
+		attribute.Int("llm_d.pd_proxy.chunked_decode.chunk_size", s.config.DecodeChunkSize),
+		attribute.Bool("llm_d.pd_proxy.chunked_decode.streaming", streamingEnabled),
 	)
 
 	// If the token budget fits within a single chunk, skip chunking entirely.
 	if originalMaxTokens > 0 && originalMaxTokens <= s.config.DecodeChunkSize {
-		s.logger.V(logging.DEBUG).Info("chunked decode: token budget <= chunk size, using regular decode",
+		s.logger.V(4).Info("chunked decode: token budget <= chunk size, using regular decode",
 			"maxTokens", originalMaxTokens, "chunkSize", s.config.DecodeChunkSize)
 		s.decoderProxy.ServeHTTP(w, r)
 		return
@@ -138,7 +134,7 @@ func (s *Server) runChunkedDecodeFromMap(w http.ResponseWriter, r *http.Request,
 
 		remaining := remainingTokens(originalMaxTokens, totalTokens)
 		if remaining == 0 {
-			s.logger.V(logging.DEBUG).Info("chunked decode: token budget exhausted", "totalTokens", totalTokens)
+			s.logger.V(4).Info("chunked decode: token budget exhausted", "totalTokens", totalTokens)
 			break
 		}
 
@@ -147,7 +143,7 @@ func (s *Server) runChunkedDecodeFromMap(w http.ResponseWriter, r *http.Request,
 			chunkBudget = remaining
 		}
 
-		chunkReq := maps.Clone(body)
+		chunkReq := maps.Clone(completionRequest)
 		chunkReq[requestFieldMaxTokens] = chunkBudget
 		chunkReq[requestFieldMaxCompletionTokens] = chunkBudget
 		chunkReq[requestFieldStream] = false
@@ -169,7 +165,7 @@ func (s *Server) runChunkedDecodeFromMap(w http.ResponseWriter, r *http.Request,
 			return
 		}
 
-		s.logger.V(logging.DEBUG).Info("chunked decode: dispatching chunk",
+		s.logger.V(4).Info("chunked decode: dispatching chunk",
 			"chunk", chunkIndex, "chunkBudget", chunkBudget, "totalTokensSoFar", totalTokens)
 
 		bw := &bufferedResponseWriter{}
@@ -202,7 +198,7 @@ func (s *Server) runChunkedDecodeFromMap(w http.ResponseWriter, r *http.Request,
 		}
 		chunkIndex++
 
-		s.logger.V(logging.DEBUG).Info("chunked decode: chunk complete", "chunkTokens", chunkTokens, "totalTokens", totalTokens)
+		s.logger.V(4).Info("chunked decode: chunk complete", "chunkTokens", chunkTokens, "totalTokens", totalTokens)
 
 		finishReason := extractFinishReason(chunkResponse)
 		chunkText := extractChoiceText(firstChoice(chunkResponse))
@@ -220,7 +216,7 @@ func (s *Server) runChunkedDecodeFromMap(w http.ResponseWriter, r *http.Request,
 		}
 
 		if finishReason != "" && finishReason != finishReasonLength {
-			s.logger.V(logging.DEBUG).Info("chunked decode: terminal finish reason, stopping",
+			s.logger.V(4).Info("chunked decode: terminal finish reason, stopping",
 				"finishReason", finishReason, "chunks", chunkIndex)
 			break
 		}
@@ -235,14 +231,14 @@ func (s *Server) runChunkedDecodeFromMap(w http.ResponseWriter, r *http.Request,
 
 		// Append the generated text to the request so the next chunk continues
 		// from where this one left off.
-		s.logger.V(logging.TRACE).Info("chunked decode: appending chunk text to request", "chunkText", chunkText)
-		appendChunkToRequest(s.logger, body, chunkText)
+		s.logger.V(5).Info("chunked decode: appending chunk text to request", "chunkText", chunkText)
+		appendChunkToRequest(completionRequest, chunkText)
 	}
 
 	span.SetAttributes(
-		semconv.LLMDPDProxyChunkedDecodeChunks(chunkIndex),
-		semconv.LLMDPDProxyChunkedDecodeTotalTokens(totalTokens),
-		semconv.LLMDPDProxyChunkedDecodeDurationMs(float64(time.Since(decodeStart).Milliseconds())),
+		attribute.Int("llm_d.pd_proxy.chunked_decode.chunks", chunkIndex),
+		attribute.Int("llm_d.pd_proxy.chunked_decode.total_tokens", totalTokens),
+		attribute.Float64("llm_d.pd_proxy.chunked_decode.duration_ms", float64(time.Since(decodeStart).Milliseconds())),
 	)
 
 	// Corrected cumulative usage: prompt_tokens from first chunk, completion_tokens summed.
@@ -420,26 +416,16 @@ func extractChoiceText(choice map[string]any) string {
 }
 
 // appendChunkToRequest appends the generated text from a chunk to the request
-// so the next chunk continues from where this one left off. The messages the
-// client sent are appended to as raw bytes, keeping their key order intact
-// across chunks.
-func appendChunkToRequest(logger logr.Logger, req map[string]any, text string) {
+// so the next chunk continues from where this one left off.
+func appendChunkToRequest(req map[string]any, text string) {
 	if text == "" {
 		return
 	}
-	messages, err := requestMessages(req)
-	if err != nil {
-		logger.V(logging.DEBUG).Info("chunked decode: cannot read request messages", "error", err)
-	}
-	chunk, err := json.Marshal(map[string]any{
+	messages, _ := req[requestFieldMessages].([]any)
+	req[requestFieldMessages] = append(messages, map[string]any{
 		requestFieldRole:    roleAssistant,
 		requestFieldContent: text,
 	})
-	if err != nil {
-		logger.V(logging.DEBUG).Info("chunked decode: cannot encode chunk text", "error", err)
-		return
-	}
-	req[requestFieldMessages] = append(messages, chunk)
 }
 
 // toInt converts a JSON number value (float64, int, or json.Number) to int.

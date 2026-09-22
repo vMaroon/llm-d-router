@@ -1,6 +1,5 @@
 /*
 Copyright 2026 The Kubernetes Authors.
-Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -53,11 +52,11 @@ func (b HashBlock) Hash() uint64 {
 }
 
 // GetBlockHashes divides the tokenized prompt into blocks and calculates a
-// prefix cache hash for each block. Each prompt in Prompts is hashed
+// prefix cache hash for each block. Each prompt in PerPromptTokens is hashed
 // independently so cross-prompt block adjacency is avoided. The first block
 // hash of every prompt includes the model name and cache salt (if provided).
 // For subsequent blocks, the hash is calculated as: hash(block i content, hash(i-1)).
-// It requires request.Body.TokenizedRequest to be populated by a token-producer backend.
+// It requires request.Body.TokenizedPrompt to be populated by a token-producer backend.
 func GetBlockHashes(ctx context.Context, request *scheduling.InferenceRequest, blockSizeTokens int, maxPrefixBlocks int) [][]BlockHash {
 	loggerDebug := log.FromContext(ctx).V(logutil.DEBUG)
 	if request == nil || request.Body == nil {
@@ -65,15 +64,15 @@ func GetBlockHashes(ctx context.Context, request *scheduling.InferenceRequest, b
 		return nil
 	}
 
-	tp := request.Body.TokenizedRequest
+	tp := request.Body.TokenizedPrompt
 	if tp == nil || tp.TokenCount() == 0 {
-		loggerDebug.Info("TokenizedRequest is empty, skipping hashing")
+		loggerDebug.Info("TokenizedPrompt is empty, skipping hashing")
 		return nil
 	}
 
 	var result [][]BlockHash
-	for _, p := range tp.Prompts {
-		seq := getKVCacheBlocksFromTokens(p.TokenIDs, blockSizeTokens)
+	for _, tokens := range tp.PerPromptTokens {
+		seq := getKVCacheBlocksFromTokens(tokens, blockSizeTokens)
 		hashes := computeBlockHashes(seq, request, maxPrefixBlocks)
 		if len(hashes) > 0 {
 			result = append(result, hashes)
@@ -93,7 +92,7 @@ func computeBlockHashes(seq iter.Seq[HashBlock], request *scheduling.InferenceRe
 	h := xxhash.New()
 	// Different models should have different hashes even with the same body.
 	_, _ = h.Write([]byte(request.TargetModel))
-	if cacheSalt := request.Body.TokenizedRequest.CacheSalt; cacheSalt != "" {
+	if cacheSalt := request.Body.TokenizedPrompt.CacheSalt; cacheSalt != "" {
 		_, _ = h.Write([]byte(cacheSalt))
 	}
 

@@ -1,6 +1,5 @@
 /*
 Copyright 2026 The Kubernetes Authors.
-Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,8 +19,6 @@ package metrics
 import (
 	"errors"
 	"fmt"
-
-	fwkplugins "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins"
 )
 
 const (
@@ -29,7 +26,7 @@ const (
 	DefaultEngineType = "default"
 
 	// DefaultEngineTypeLabelKey is the default label on Pods that indicates the inference engine type.
-	DefaultEngineTypeLabelKey = fwkplugins.EngineTypeLabelKey
+	DefaultEngineTypeLabelKey = "llm-d.ai/engine-type"
 
 	// legacyGAIEEngineTypeLabelKey is the legacy GAIE label key, kept for backward compatibility.
 	//

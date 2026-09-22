@@ -1,6 +1,5 @@
 /*
 Copyright 2025 The Kubernetes Authors.
-Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -148,7 +147,7 @@ func createTestInferenceRequest(reqID string, ttftSLO, tpotSLO float64) *fwksche
 		Completions: &fwkrh.CompletionsRequest{
 			Prompt: fwkrh.Prompt{Raw: "test prompt"},
 		},
-		TokenizedRequest: &fwkrh.TokenizedRequest{Prompts: []fwkrh.PromptTokens{{TokenIDs: make([]uint32, 2)}}},
+		TokenizedPrompt: &fwkrh.TokenizedPrompt{PerPromptTokens: [][]uint32{make([]uint32, 2)}},
 	})
 }
 
@@ -160,7 +159,7 @@ func createTestChatCompletionsInferenceRequest(reqID string, ttftSLO, tpotSLO fl
 				{Role: "user", Content: fwkrh.Content{Raw: "Tell me a joke."}},
 			},
 		},
-		TokenizedRequest: &fwkrh.TokenizedRequest{Prompts: []fwkrh.PromptTokens{{TokenIDs: make([]uint32, 8)}}},
+		TokenizedPrompt: &fwkrh.TokenizedPrompt{PerPromptTokens: [][]uint32{make([]uint32, 8)}},
 	})
 }
 

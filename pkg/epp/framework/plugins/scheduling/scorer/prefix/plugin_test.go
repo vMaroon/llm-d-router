@@ -1,6 +1,5 @@
 /*
 Copyright 2025 The Kubernetes Authors.
-Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -108,7 +107,7 @@ func TestPrefixPluginScoreAggregatesMissingMatchInfo(t *testing.T) {
 	}
 	require.Len(t, sink.infos, 1)
 	assert.Empty(t, sink.errors)
-	assert.Equal(t, logging.DEFAULT, sink.infos[0].level)
+	assert.Equal(t, logging.DEBUG, sink.infos[0].level)
 	assert.Equal(t, "PrefixCacheMatchInfo not found for endpoints, assigning score 0", sink.infos[0].msg)
 	assert.Equal(t, len(endpoints), logValue(sink.infos[0], "count"))
 }
@@ -141,7 +140,7 @@ func TestPrefixPluginScoreMixedMissingMatchInfo(t *testing.T) {
 
 	require.Len(t, sink.infos, 1, "one aggregate record per scoring call")
 	assert.Empty(t, sink.errors)
-	assert.Equal(t, logging.DEFAULT, sink.infos[0].level)
+	assert.Equal(t, logging.DEBUG, sink.infos[0].level)
 	assert.Equal(t, 2, logValue(sink.infos[0], "count"), "count covers only endpoints missing match info")
 }
 

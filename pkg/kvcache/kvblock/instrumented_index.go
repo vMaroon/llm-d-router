@@ -26,22 +26,10 @@ type instrumentedIndex struct {
 	next Index
 }
 
-// instrumentedWalker carries the KeyWalker capability of the wrapped index.
-type instrumentedWalker struct {
-	*instrumentedIndex
-	walker KeyWalker
-}
-
-// NewInstrumentedIndex wraps an Index and emits metrics for Add, Evict,
-// Lookup, and WalkKeys. The wrapper is a KeyWalker exactly when next is one.
-// Read metrics count and time Lookup and WalkKeys calls; contiguous-chain
-// hit metrics are recorded by the kvcache matcher.
+// NewInstrumentedIndex wraps an Index and emits metrics for Add, Evict, and
+// Lookup.
 func NewInstrumentedIndex(next Index) Index {
-	m := &instrumentedIndex{next: next}
-	if walker, ok := next.(KeyWalker); ok {
-		return &instrumentedWalker{instrumentedIndex: m, walker: walker}
-	}
-	return m
+	return &instrumentedIndex{next: next}
 }
 
 func (m *instrumentedIndex) Add(ctx context.Context, engineKeys, requestKeys []BlockHash, entries []PodEntry) error {
@@ -66,19 +54,49 @@ func (m *instrumentedIndex) Lookup(
 
 	metrics.LookupRequests.Inc()
 
-	return m.next.Lookup(ctx, requestKeys, podIdentifierSet)
+	pods, err := m.next.Lookup(ctx, requestKeys, podIdentifierSet)
+	if err != nil {
+		return nil, err
+	}
+
+	// Synchronous: callers own requestKeys and the result map after return,
+	// so a deferred fold would race their reuse.
+	recordHitMetrics(requestKeys, pods)
+
+	return pods, nil
 }
 
-// WalkKeys forwards the walk as a lookup request.
-func (m *instrumentedWalker) WalkKeys(ctx context.Context, requestKeys []BlockHash,
-	visit func(pos int, found bool, entries []EntryRef) bool,
-) error {
+// ScoredLookup forwards the fused lookup capability with the same request,
+// latency, and hit metrics as Lookup. Returns ErrScoredLookupUnsupported when
+// the wrapped backend lacks the capability.
+func (m *instrumentedIndex) ScoredLookup(ctx context.Context, requestKeys []BlockHash,
+	podIdentifierSet sets.Set[string], tierWeights map[string]float64,
+) (map[string]PodMatchStats, error) {
+	inner, ok := m.next.(ScoredLookupIndex)
+	if !ok {
+		return nil, ErrScoredLookupUnsupported
+	}
+
 	timer := prometheus.NewTimer(metrics.LookupLatency)
 	defer timer.ObserveDuration()
 
 	metrics.LookupRequests.Inc()
 
-	return m.walker.WalkKeys(ctx, requestKeys, visit)
+	result, err := inner.ScoredLookup(ctx, requestKeys, podIdentifierSet, tierWeights)
+	if err != nil {
+		return nil, err
+	}
+
+	maxHit := 0
+	for _, stats := range result {
+		if stats.MatchedBlocks > maxHit {
+			maxHit = stats.MatchedBlocks
+		}
+	}
+	metrics.MaxPodHitCount.Add(float64(maxHit))
+	metrics.LookupHits.Add(float64(maxHit))
+
+	return result, nil
 }
 
 func (m *instrumentedIndex) GetRequestKey(ctx context.Context, engineKey BlockHash) (BlockHash, error) {
@@ -87,4 +105,59 @@ func (m *instrumentedIndex) GetRequestKey(ctx context.Context, engineKey BlockHa
 
 func (m *instrumentedIndex) Clear(ctx context.Context, podIdentifier string) error {
 	return m.next.Clear(ctx, podIdentifier)
+}
+
+func recordHitMetrics(requestKeys []BlockHash, keyToPods map[BlockHash][]PodEntry) {
+	maxHit := maxContiguousPodHits(requestKeys, keyToPods)
+	metrics.MaxPodHitCount.Add(float64(maxHit))
+	metrics.LookupHits.Add(float64(maxHit))
+}
+
+// maxContiguousPodHits returns the longest contiguous prefix chain any single
+// pod holds, counting from the first request key - the same quantity the
+// fused ScoredLookup path reports as MatchedBlocks. One state map serves the
+// whole fold; a pod stays in the chain while its last-seen key is the
+// preceding one, and duplicate device tiers at a key count once.
+func maxContiguousPodHits(requestKeys []BlockHash, keyToPods map[BlockHash][]PodEntry) int {
+	if len(requestKeys) == 0 {
+		return 0
+	}
+	type podState struct {
+		lastKey int
+		count   int
+	}
+	state := make(map[string]podState, len(keyToPods[requestKeys[0]]))
+	best := 0
+	for i, key := range requestKeys {
+		entries := keyToPods[key]
+		if len(entries) == 0 {
+			break // no pod holds this key: every chain from key 0 ends here
+		}
+		advanced := false
+		for _, e := range entries {
+			s, ok := state[e.PodIdentifier]
+			switch {
+			case i == 0 && !ok:
+				state[e.PodIdentifier] = podState{lastKey: 0, count: 1}
+				advanced = true
+				if best == 0 {
+					best = 1
+				}
+			case ok && s.lastKey == i-1:
+				s.lastKey = i
+				s.count++
+				state[e.PodIdentifier] = s
+				advanced = true
+				if s.count > best {
+					best = s.count
+				}
+			default:
+				// Duplicate tier at this key, or a pod outside the chain.
+			}
+		}
+		if !advanced {
+			break // no chain advanced at this key; later keys cannot either
+		}
+	}
+	return best
 }

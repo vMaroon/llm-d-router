@@ -1,6 +1,5 @@
 /*
 Copyright 2025 The Kubernetes Authors.
-Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -442,20 +441,16 @@ func NewResponseStreamChunk(body string, endOfStream bool) *extProcPb.Processing
 	}
 }
 
-// NewImmediateErrorResponse creates a response that immediately terminates the request with a specific HTTP status code,
-// body, and optional response headers.
+// NewImmediateErrorResponse creates a response that immediately terminates the request with a specific HTTP status code
+// and body.
 // Use this for testing Load Shedding (503), Rate Limiting (429), or Bad Request (400) logic.
-func NewImmediateErrorResponse(code envoyTypePb.StatusCode, body string, headers ...*envoyCorev3.HeaderValueOption) []*extProcPb.ProcessingResponse {
-	immediateResponse := &extProcPb.ImmediateResponse{
-		Status: &envoyTypePb.HttpStatus{Code: code},
-		Body:   []byte(body),
-	}
-	if len(headers) > 0 {
-		immediateResponse.Headers = &extProcPb.HeaderMutation{SetHeaders: headers}
-	}
+func NewImmediateErrorResponse(code envoyTypePb.StatusCode, body string) []*extProcPb.ProcessingResponse {
 	return []*extProcPb.ProcessingResponse{{
 		Response: &extProcPb.ProcessingResponse_ImmediateResponse{
-			ImmediateResponse: immediateResponse,
+			ImmediateResponse: &extProcPb.ImmediateResponse{
+				Status: &envoyTypePb.HttpStatus{Code: code},
+				Body:   []byte(body),
+			},
 		},
 	}}
 }

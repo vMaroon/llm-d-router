@@ -1,6 +1,5 @@
 /*
 Copyright 2025 The Kubernetes Authors.
-Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -108,41 +107,6 @@ plugins:
     dependency: test1
 - name: test1
   type: test-plugin
-`
-
-// maxSaturationDetectorSortsBeforeChildrenText represents a valid config with a composite
-// saturation detector whose name sorts before the names of the detectors it references
-const maxSaturationDetectorSortsBeforeChildrenText = `
-apiVersion: llm-d.ai/v1alpha1
-kind: EndpointPickerConfig
-plugins:
-- name: decode-concurrency
-  type: utilization-detector
-- name: prefill-queue
-  type: utilization-detector
-- name: admission-split
-  type: max-saturation-detector
-  parameters:
-    detectors: [decode-concurrency, prefill-queue]
-`
-
-// maxSaturationDetectorStageScopedText represents a valid config with a composite saturation
-// detector whose children are restricted to pipeline stages
-const maxSaturationDetectorStageScopedText = `
-apiVersion: llm-d.ai/v1alpha1
-kind: EndpointPickerConfig
-plugins:
-- name: decode-concurrency
-  type: utilization-detector
-- name: prefill-queue
-  type: utilization-detector
-- name: admission-split
-  type: max-saturation-detector
-  parameters:
-    detectors: [decode-concurrency, prefill-queue]
-    stages:
-      decode-concurrency: [decode]
-      prefill-queue: [prefill]
 `
 
 // pluginsRefedByPointerText represents a valid config with a plugin that is dependent
@@ -298,25 +262,6 @@ featureGates:
 flowControl:
   maxBytes: "1024"
   defaultRequestTTL: 1m
-  noEndpointRequestTTL: 5m
-`
-
-// successFlowControlInheritedTTLText covers a config that names only defaultRequestTTL: the no-endpoint budget follows
-// it, so disabling the TTL is not silently narrowed to the regime where the pool has endpoints.
-const successFlowControlInheritedTTLText = `
-apiVersion: llm-d.ai/v1alpha1
-kind: EndpointPickerConfig
-plugins:
-- name: maxScore
-  type: max-score-picker
-schedulingProfiles:
-- name: default
-  plugins:
-  - pluginRef: maxScore
-featureGates:
-- flowControl
-flowControl:
-  defaultRequestTTL: 0s
 `
 
 const successflowControlConfigDisabledText = `
@@ -378,9 +323,8 @@ schedulingProfiles:
   plugins:
   - pluginRef: maxScore
 featureGates: ["flowControl=false"]
-flowControl:
-  saturationDetector:
-    pluginRef: utilization-detector
+saturationDetector:
+  pluginRef: utilization-detector
 `
 
 // successComplexFlowControlConfigText tests that Flow Control configuration with custom plugins is correctly loaded.
@@ -401,14 +345,10 @@ schedulingProfiles:
 featureGates:
 - flowControl
 flowControl:
-  defaultRequestTTL: 1m
   priorityBands:
   - priority: 100
-    defaultRequestTTL: 5m
     orderingPolicyRef: customFCFS
     fairnessPolicyRef: customFairness
-  - priority: -1
-    defaultRequestTTL: 0s
 `
 
 // successParserConfigText tests that configuration with parser plugin is correctly loaded.
@@ -477,27 +417,6 @@ requestHandler:
   parsers:
   - pluginRef: openai-parser
   - pluginRef: secondParser
-`
-
-// successExplicitPassthroughConfigText configures a fallback explicitly under a
-// custom name, alongside a claimed-path parser.
-const successExplicitPassthroughConfigText = `
-apiVersion: llm-d.ai/v1alpha1
-kind: EndpointPickerConfig
-plugins:
-- name: maxScore
-  type: max-score-picker
-- type: openai-parser
-- name: myFallback
-  type: passthrough-parser
-schedulingProfiles:
-- name: default
-  plugins:
-  - pluginRef: maxScore
-requestHandler:
-  parsers:
-  - pluginRef: openai-parser
-  - pluginRef: myFallback
 `
 
 // successDataLayerAutoDefaultText has the datalayer enabled without data config.
@@ -974,27 +893,9 @@ schedulingProfiles:
   - pluginRef: maxScorePicker
 `
 
-// successDeprecatedDiscoveryPluginRefText tests that the deprecated bare
-// discovery.pluginRef is migrated to discovery.endpoints.pluginRef.
-const successDeprecatedDiscoveryPluginRefText = `
-apiVersion: llm-d.ai/v1alpha1
-kind: EndpointPickerConfig
-plugins:
-- name: maxScore
-  type: max-score-picker
-- name: my-disc
-  type: file-discovery
-schedulingProfiles:
-- name: default
-  plugins:
-  - pluginRef: maxScore
-dataLayer:
-  discovery:
-    pluginRef: my-disc
-`
-
-// errorRemovedTopLevelSaturationDetectorText tests that the removed top-level saturationDetector field is rejected.
-const errorRemovedTopLevelSaturationDetectorText = `
+// successDeprecatedTopLevelSaturationDetectorText tests that top-level saturationDetector is correctly loaded,
+// copied to nested location, and handled.
+const successDeprecatedTopLevelSaturationDetectorText = `
 apiVersion: llm-d.ai/v1alpha1
 kind: EndpointPickerConfig
 plugins:
@@ -1010,8 +911,9 @@ saturationDetector:
   pluginRef: utilization-detector
 `
 
-// errorRemovedTopLevelParserText tests that the removed top-level parser field is rejected.
-const errorRemovedTopLevelParserText = `
+// successDeprecatedTopLevelParserText tests that top-level parser is correctly loaded,
+// copied to nested location, and handled.
+const successDeprecatedTopLevelParserText = `
 apiVersion: llm-d.ai/v1alpha1
 kind: EndpointPickerConfig
 plugins:

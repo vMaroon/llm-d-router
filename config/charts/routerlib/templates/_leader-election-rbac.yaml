@@ -1,7 +1,5 @@
 {{- define "llm-d-epp.leader-election-rbac" -}}
-{{- $isPriorityRouting := eq (include "llm-d-router.priorityRouting.enabled" .) "true" -}}
-{{- $gkePB := include "llm-d-router.gkePreferredBackends" . | fromYaml | default dict -}}
-{{- if and (gt (.Values.router.epp.replicas | int) 1) (not $gkePB.enabled) (not $isPriorityRouting) }}
+{{- if gt (.Values.router.epp.replicas | int) 1 }}
 ---
 kind: Role
 apiVersion: rbac.authorization.k8s.io/v1

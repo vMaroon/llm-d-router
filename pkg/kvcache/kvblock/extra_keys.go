@@ -41,14 +41,12 @@ type PlaceholderRange struct {
 }
 
 // ParseRawExtraKeys converts the raw [][]any from BlockStoredEvent.ExtraKeys
-// into typed []*BlockExtraFeatures. A first entry equal to loraName is dropped;
-// the request key carries the adapter as its model name. Each other element is
-// either:
+// into typed []*BlockExtraFeatures. Each inner []any element is either:
 //   - a bare string identifier (vLLM v0.18.0+: mm_feature.identifier), or
 //   - a 2-element [string, int] tuple (legacy format, offset is ignored).
 //
 // nil inner slices produce nil entries. Returns nil if raw is nil.
-func ParseRawExtraKeys(raw [][]any, loraName string) ([]*BlockExtraFeatures, error) {
+func ParseRawExtraKeys(raw [][]any) ([]*BlockExtraFeatures, error) {
 	if raw == nil {
 		return nil, nil
 	}
@@ -57,9 +55,6 @@ func ParseRawExtraKeys(raw [][]any, loraName string) ([]*BlockExtraFeatures, err
 	for blockIdx, blockKeys := range raw {
 		if blockKeys == nil {
 			continue
-		}
-		if loraName != "" && len(blockKeys) > 0 && blockKeys[0] == loraName {
-			blockKeys = blockKeys[1:]
 		}
 
 		features := &BlockExtraFeatures{}
@@ -76,7 +71,7 @@ func ParseRawExtraKeys(raw [][]any, loraName string) ([]*BlockExtraFeatures, err
 					}
 				}
 			default:
-				// Skip unknown entry types.
+				// Skip unknown entry types (e.g. LoRA, cache salt).
 				continue
 			}
 		}

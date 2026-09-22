@@ -1,20 +1,5 @@
 #!/bin/bash
 
-# Copyright 2025 The llm-d Authors.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-
 # This shell script deploys a kind cluster with an Istio-based Gateway API
 # implementation fully configured. It deploys the vllm simulator, which it
 # exposes with a Gateway -> HTTPRoute -> InferencePool. The Gateway is
@@ -121,6 +106,9 @@ fi
 # By default we are not setting up for KV cache
 export KV_CACHE_ENABLED="${KV_CACHE_ENABLED:-false}"
 
+# By default we are not setting up for external tokenizer
+export EXTERNAL_TOKENIZER_ENABLED="${EXTERNAL_TOKENIZER_ENABLED:-false}"
+
 # Replica counts for E (Encode), P (Prefill), and D (Decode)
 export VLLM_REPLICA_COUNT_E="${VLLM_REPLICA_COUNT_E:-1}"
 export VLLM_REPLICA_COUNT_P="${VLLM_REPLICA_COUNT_P:-1}"
@@ -170,7 +158,9 @@ fi
 
 # Determine EPP config file based on disaggregation flags
 # KV cache and data parallel are independent options that work with any mode
-if [ "${KV_CACHE_ENABLED}" == "true" ]; then
+if [ "${EXTERNAL_TOKENIZER_ENABLED}" == "true" ]; then
+  DEFAULT_EPP_CONFIG="deploy/config/sim-epp-external-tokenizer-config.yaml"
+elif [ "${KV_CACHE_ENABLED}" == "true" ]; then
   DEFAULT_EPP_CONFIG="deploy/config/sim-epp-kvcache-config.yaml"
 elif [ "${DISAGG_E}" == "true" ] && [ "${DISAGG_P}" == "true" ]; then
   DEFAULT_EPP_CONFIG="deploy/config/sim-e-p-d-epp-config.yaml"
@@ -415,7 +405,7 @@ TEMP_FILE=$(mktemp)
 trap "rm -f \"${TEMP_FILE}\"" EXIT
 
 kubectl --context ${KUBE_CONTEXT} delete configmap epp-config --ignore-not-found
-envsubst '${MODEL_NAME} ${VLLM_RENDER_URL}' < ${EPP_CONFIG} > ${TEMP_FILE}
+envsubst '$MODEL_NAME' < ${EPP_CONFIG} > ${TEMP_FILE}
 kubectl --context ${KUBE_CONTEXT} create configmap epp-config --from-file=epp-config.yaml=${TEMP_FILE}
 
 # The replica count is changed in some end to end tests

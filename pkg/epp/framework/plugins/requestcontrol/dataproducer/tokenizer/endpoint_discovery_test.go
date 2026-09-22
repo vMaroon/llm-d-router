@@ -280,7 +280,7 @@ func TestVLLMHTTPRenderer_DiscoveryRoundRobin(t *testing.T) {
 	serverB := newRenderServer(2)
 	t.Cleanup(serverB.Close)
 
-	renderer, err := newVLLMHTTPRenderer(&vllmConfig{EndpointDiscovery: &endpointDiscoveryConfig{}})
+	renderer, err := newVLLMHTTPRenderer(&vllmConfig{EndpointDiscovery: &endpointDiscoveryConfig{}}, testHTTPModel)
 	require.NoError(t, err)
 	picker := renderer.endpointPicker.(*discoveredEndpointPicker)
 	for name, server := range map[string]*httptest.Server{"rank-a": serverA, "rank-b": serverB} {
@@ -310,7 +310,7 @@ func TestVLLMHTTPRenderer_DiscoveryRetriesDifferentEndpoint(t *testing.T) {
 	}))
 	t.Cleanup(successfulServer.Close)
 
-	renderer, err := newVLLMHTTPRenderer(&vllmConfig{EndpointDiscovery: &endpointDiscoveryConfig{}})
+	renderer, err := newVLLMHTTPRenderer(&vllmConfig{EndpointDiscovery: &endpointDiscoveryConfig{}}, testHTTPModel)
 	require.NoError(t, err)
 	picker := renderer.endpointPicker.(*discoveredEndpointPicker)
 	for name, server := range map[string]*httptest.Server{"rank-a": failedServer, "rank-b": successfulServer} {
@@ -323,6 +323,12 @@ func TestVLLMHTTPRenderer_DiscoveryRetriesDifferentEndpoint(t *testing.T) {
 	assert.Equal(t, [][]uint32{{42}}, tokens)
 	assert.Equal(t, int32(1), failedCalls.Load())
 	assert.Equal(t, int32(1), successfulCalls.Load())
+}
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return f(request)
 }
 
 func TestVLLMHTTPRenderer_DiscoveryRetriesTransportFailureWithinRequestTimeout(t *testing.T) {
@@ -348,6 +354,7 @@ func TestVLLMHTTPRenderer_DiscoveryRetriesTransportFailureWithinRequestTimeout(t
 			}, nil
 		})},
 		endpointPicker: picker,
+		modelName:      testHTTPModel,
 		timeout:        time.Second,
 	}
 
@@ -496,14 +503,10 @@ func TestVLLMHTTPRenderer_DiscoveryPreservesFullTimeoutByDefault(t *testing.T) {
 
 func TestVLLMHTTPRenderer_DiscoveryAttemptTimeoutConfiguration(t *testing.T) {
 	for _, value := range []string{"", "100ms", "0s", "-1s", "invalid"} {
-		name := value
-		if name == "" {
-			name = "unset"
-		}
-		t.Run(name, func(t *testing.T) {
+		t.Run(value, func(t *testing.T) {
 			renderer, err := newVLLMHTTPRenderer(&vllmConfig{
 				EndpointDiscovery: &endpointDiscoveryConfig{AttemptTimeout: value},
-			})
+			}, testHTTPModel)
 			switch value {
 			case "":
 				require.NoError(t, err)
@@ -516,43 +519,6 @@ func TestVLLMHTTPRenderer_DiscoveryAttemptTimeoutConfiguration(t *testing.T) {
 			}
 		})
 	}
-}
-
-func TestVLLMHTTPRenderer_DiscoveryRetriesWithinRemainingBudget(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		picker, err := newDiscoveredEndpointPicker(&endpointDiscoveryConfig{})
-		require.NoError(t, err)
-		for _, name := range []string{"a", "b"} {
-			require.NoError(t, picker.Upsert(discoveredEndpoint(name, name, "8000").GetMetadata()))
-		}
-		start := time.Now()
-		var hosts []string
-		renderer := &vllmHTTPRenderer{
-			endpointPicker: picker,
-			timeout:        5 * time.Second,
-			client: &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
-				hosts = append(hosts, req.URL.Hostname())
-				deadline, ok := req.Context().Deadline()
-				assert.True(t, ok)
-				assert.Equal(t, start.Add(5*time.Second), deadline)
-				delay, status := time.Second, http.StatusOK
-				if req.URL.Hostname() == "a" {
-					delay, status = 3*time.Second, http.StatusServiceUnavailable
-				}
-				select {
-				case <-time.After(delay):
-					return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(`[{"token_ids":[7]}]`))}, nil
-				case <-req.Context().Done():
-					return nil, req.Context().Err()
-				}
-			})},
-		}
-		tokens, _, err := renderer.Render(t.Context(), fwkrh.PayloadMap{"prompt": "hello"})
-		require.NoError(t, err)
-		assert.Equal(t, [][]uint32{{7}}, tokens)
-		assert.Equal(t, []string{"a", "b"}, hosts)
-		assert.Equal(t, 4*time.Second, time.Since(start))
-	})
 }
 
 func TestVLLMHTTPRenderer_DiscoveryHonorsCallerDeadline(t *testing.T) {
@@ -602,7 +568,7 @@ func TestVLLMHTTPRenderer_DiscoveryDoesNotRetryDeterministicClientError(t *testi
 	}))
 	t.Cleanup(alternateServer.Close)
 
-	renderer, err := newVLLMHTTPRenderer(&vllmConfig{EndpointDiscovery: &endpointDiscoveryConfig{}})
+	renderer, err := newVLLMHTTPRenderer(&vllmConfig{EndpointDiscovery: &endpointDiscoveryConfig{}}, testHTTPModel)
 	require.NoError(t, err)
 	picker := renderer.endpointPicker.(*discoveredEndpointPicker)
 	for name, server := range map[string]*httptest.Server{"rank-a": clientErrorServer, "rank-b": alternateServer} {
@@ -637,7 +603,7 @@ func TestVLLMHTTPRenderer_EndpointPickErrorHasContext(t *testing.T) {
 	pickErr := errors.New("picker failed")
 	renderer := &vllmHTTPRenderer{endpointPicker: errorEndpointPicker{err: pickErr}}
 
-	err := renderer.postJSON(context.Background(), completionsRenderPath, fwkrh.PayloadMap{}, time.Second, &renderResponse{})
+	err := renderer.postJSON(context.Background(), completionsRenderPath, map[string]any{}, time.Second, &renderResponse{})
 	require.ErrorContains(t, err, "pick render endpoint")
 	assert.ErrorIs(t, err, pickErr)
 }
@@ -688,26 +654,6 @@ func TestPlugin_DiscoveryRegistersAndTracksEndpointNotifications(t *testing.T) {
 	}))
 	_, err = handler.picker.Pick()
 	require.Error(t, err)
-}
-
-func TestEndpointDiscoveryHandler_ReportsMissingEndpointMetadata(t *testing.T) {
-	for _, tc := range []struct {
-		name     string
-		endpoint fwkdl.Endpoint
-	}{
-		{name: "nil endpoint"},
-		{name: "nil metadata", endpoint: &fwkdl.ModelServer{}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			picker, err := newDiscoveredEndpointPicker(&endpointDiscoveryConfig{})
-			require.NoError(t, err)
-			handler := newEndpointDiscoveryHandler(plugin.TypedName{Type: PluginType, Name: "test"}, picker)
-			for _, eventType := range []fwkdl.EventType{fwkdl.EventAddOrUpdate, fwkdl.EventDelete} {
-				err := handler.Extract(t.Context(), fwkdl.EndpointEvent{Type: eventType, Endpoint: tc.endpoint})
-				require.ErrorContains(t, err, "endpoint or metadata is nil")
-			}
-		})
-	}
 }
 
 func TestEndpointDiscoveryHandler_IgnoresStaleDelete(t *testing.T) {

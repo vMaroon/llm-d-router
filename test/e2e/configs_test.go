@@ -1,19 +1,3 @@
-/*
-Copyright 2026 The llm-d Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
 package e2e
 
 import "fmt"
@@ -32,6 +16,42 @@ plugins:
 - type: single-profile-handler
 schedulingProfiles:
 - name: default
+  plugins:
+  - pluginRef: decode-filter
+  - pluginRef: max-score-picker
+  - pluginRef: prefix-cache-scorer
+    weight: 2
+`
+
+// EPP configuration for running with P/D
+// Uses deprecated pd-profile-handler
+const deprecatedPdConfig = `apiVersion: llm-d.ai/v1alpha1
+kind: EndpointPickerConfig
+plugins:
+- type: prefill-header-handler
+- type: approx-prefix-cache-producer
+  parameters:
+    blockSizeTokens: 16
+    maxPrefixTokensToMatch: 16384
+    lruCapacityPerServer: 256
+- type: prefix-cache-scorer
+- type: prefill-filter
+- type: decode-filter
+- type: max-score-picker
+- type: prefix-based-pd-decider
+  parameters:
+    nonCachedTokens: 16
+- type: pd-profile-handler
+  parameters:
+    deciderPluginName: prefix-based-pd-decider
+schedulingProfiles:
+- name: prefill
+  plugins:
+  - pluginRef: prefill-filter
+  - pluginRef: max-score-picker
+  - pluginRef: prefix-cache-scorer
+    weight: 2
+- name: decode
   plugins:
   - pluginRef: decode-filter
   - pluginRef: max-score-picker
@@ -206,7 +226,7 @@ schedulingProfiles:
     weight: 2
 `
 
-// kvConfig returns the EPP config for precise prefix scoring with KV events.
+// kvConfig returns the EPP config for running with precise prefix scoring (i.e. KV events).
 // The render URL is built from vllmRenderPort so VLLM_RENDER_PORT is respected.
 func kvConfig() string {
 	return fmt.Sprintf(`apiVersion: llm-d.ai/v1alpha1
@@ -217,7 +237,7 @@ plugins:
     modelName: Qwen/Qwen2.5-1.5B-Instruct
     vllm:
       url: http://vllm-render:%s
-- type: precise-prefix-cache-producer
+- type: precise-prefix-cache-scorer
   parameters:
     tokenProcessorConfig:
       blockSizeTokens: 16
@@ -228,9 +248,6 @@ plugins:
       kvBlockIndexConfig:
         enableMetrics: false                  # enable kv-block index metrics (prometheus)
         metricsLoggingInterval: 60000000000   # log kv-block metrics as well (1m in nanoseconds)
-- type: prefix-cache-scorer
-  parameters:
-    prefixMatchInfoProducerName: precise-prefix-cache-producer
 - type: decode-filter
 - type: max-score-picker
 - type: disagg-profile-handler
@@ -239,13 +256,12 @@ schedulingProfiles:
   plugins:
   - pluginRef: decode-filter
   - pluginRef: max-score-picker
-  - pluginRef: prefix-cache-scorer
+  - pluginRef: precise-prefix-cache-scorer
     weight: 10
 `, vllmRenderPort)
 }
 
-// kvExternalTokenizerConfig returns the EPP config for the KV-events test that
-// covers both completions and chat completions.
+// kvExternalTokenizerConfig returns the EPP config for the external-tokenizer DataProducer variant.
 // The render URL is built from vllmRenderPort so VLLM_RENDER_PORT is respected.
 func kvExternalTokenizerConfig() string {
 	return fmt.Sprintf(`apiVersion: llm-d.ai/v1alpha1
@@ -256,7 +272,7 @@ plugins:
     modelName: Qwen/Qwen2.5-1.5B-Instruct
     vllm:
       url: http://vllm-render:%s
-- type: precise-prefix-cache-producer
+- type: precise-prefix-cache-scorer
   parameters:
     tokenProcessorConfig:
       blockSizeTokens: 16
@@ -266,9 +282,6 @@ plugins:
     indexerConfig:
       kvBlockIndexConfig:
         enableMetrics: false
-- type: prefix-cache-scorer
-  parameters:
-    prefixMatchInfoProducerName: precise-prefix-cache-producer
 - type: decode-filter
 - type: max-score-picker
 - type: disagg-profile-handler
@@ -277,7 +290,7 @@ schedulingProfiles:
   plugins:
   - pluginRef: decode-filter
   - pluginRef: max-score-picker
-  - pluginRef: prefix-cache-scorer
+  - pluginRef: precise-prefix-cache-scorer
     weight: 10
 `, vllmRenderPort)
 }

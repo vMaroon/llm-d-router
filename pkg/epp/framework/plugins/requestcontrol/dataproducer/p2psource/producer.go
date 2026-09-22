@@ -14,9 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package p2psource selects a peer within one block of the most cached prompt
-// prefix, publishes a request-wide reusable-prefix floor for scheduling, and
-// emits the selected peer in the KV cache source header after scheduling.
+// Package p2psource emits the KV cache source header: a candidate pod
+// within one block of the most cached prefix KV blocks for the request, for
+// the routing sidecar to pull from over the P2P connector instead of
+// recomputing them.
 package p2psource
 
 import (
@@ -34,12 +35,11 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
 	attrprefix "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/prefix"
-	p2psourceconstants "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/p2psource/constants"
 )
 
 const (
 	// PluginType is the registered type name of the p2p-source-producer.
-	PluginType = p2psourceconstants.P2PSourcePluginType
+	PluginType = "p2p-source-producer"
 
 	// defaultPrefillProfile is the disaggregation prefill profile name; when
 	// that profile's result carries an endpoint, that endpoint computes the
@@ -72,18 +72,16 @@ var (
 )
 
 // Producer stashes a pull-source candidate holding within one block of the
-// most cached prefix tokens and publishes a reusable-prefix floor during
-// Produce. In PreRequest it sets routing.KVCacheSourceHeader to that peer when
-// it out-caches the pod computing the prefix (the prefill endpoint under P/D
-// disaggregation, the primary endpoint otherwise) by at least
-// minCachedTokenDelta tokens.
+// most cached prefix tokens during Produce, and in PreRequest sets
+// routing.KVCacheSourceHeader to that peer when it out-caches the pod
+// computing the prefix (the prefill endpoint under P/D disaggregation, the
+// primary endpoint otherwise) by at least minCachedTokenDelta tokens.
 type Producer struct {
-	typedName                   plugin.TypedName
-	prefixMatchDataKey          plugin.DataKey
-	reusablePrefixTokensDataKey plugin.DataKey
-	minCachedTokenDelta         int
-	prefillProfile              string
-	attrKeyValue                plugin.DataKey
+	typedName           plugin.TypedName
+	prefixMatchDataKey  plugin.DataKey
+	minCachedTokenDelta int
+	prefillProfile      string
+	attrKeyValue        plugin.DataKey
 }
 
 // PluginFactory parses the raw plugin configuration and returns a configured
@@ -108,27 +106,21 @@ func New(name string, cfg Config) *Producer {
 	if prefillProfile == "" {
 		prefillProfile = defaultPrefillProfile
 	}
-	minCachedTokenDelta := cfg.MinCachedTokenDelta
-	if minCachedTokenDelta < 1 {
-		minCachedTokenDelta = defaultMinCachedTokenDelta
-	}
 	return &Producer{
-		typedName:                   plugin.TypedName{Type: PluginType, Name: name},
-		prefixMatchDataKey:          attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName(cfg.PrefixMatchInfoProducerName),
-		reusablePrefixTokensDataKey: attrprefix.ReusablePrefixTokensDataKey.WithNonEmptyProducerName(name),
-		minCachedTokenDelta:         minCachedTokenDelta,
-		prefillProfile:              prefillProfile,
-		attrKeyValue:                plugin.NewDataKey("best-match", PluginType).WithNonEmptyProducerName(name),
+		typedName:           plugin.TypedName{Type: PluginType, Name: name},
+		prefixMatchDataKey:  attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName(cfg.PrefixMatchInfoProducerName),
+		minCachedTokenDelta: cfg.MinCachedTokenDelta,
+		prefillProfile:      prefillProfile,
+		attrKeyValue:        plugin.NewDataKey("best-match", PluginType).WithNonEmptyProducerName(name),
 	}
 }
 
 // TypedName returns the plugin's registered type and name.
 func (p *Producer) TypedName() plugin.TypedName { return p.typedName }
 
-// Produces declares the request-wide reusable prefix token floor.
-func (p *Producer) Produces() map[plugin.DataKey]any {
-	return map[plugin.DataKey]any{p.reusablePrefixTokensDataKey: attrprefix.ReusablePrefixTokens(0)}
-}
+// Produces declares no produced data keys; the best-match result is carried
+// as a request attribute consumed by this plugin's own PreRequest.
+func (p *Producer) Produces() map[plugin.DataKey]any { return map[plugin.DataKey]any{} }
 
 // Consumes declares the PrefixCacheMatchInfo dependency so the data-layer
 // DAG orders the producing plugin before this one.
@@ -145,7 +137,6 @@ func (p *Producer) Consumes() plugin.DataDependencies {
 type bestMatchPeer struct {
 	hostPort     string
 	cachedTokens int
-	hasTierData  bool
 }
 
 // attrKey returns the request-attribute key carrying the best-match peer,
@@ -154,10 +145,9 @@ func (p *Producer) attrKey() plugin.DataKey {
 	return p.attrKeyValue
 }
 
-// Produce reads each candidate's PrefixCacheMatchInfo, stashes the chosen
-// source, and publishes its request-wide reusable-prefix floor. Among the
-// endpoints within one block of the most cached prompt tokens, one is sampled
-// with probability proportional to
+// Produce reads each candidate's PrefixCacheMatchInfo and stashes the chosen
+// source on the request: among the endpoints within one block of the most
+// cached prompt tokens, one is sampled with probability proportional to
 // 1/(1+waiting queue), using a request-ID hash as the sampling coordinate.
 // Load-blind argmax alone would send every consumer of a widely-replicated
 // prefix to the same peer (equal counts lose to iteration order),
@@ -175,10 +165,9 @@ func (p *Producer) Produce(ctx context.Context, request *scheduling.InferenceReq
 	// join), so they must not pin the pool maximum either: an inflated
 	// maximum would exclude every real endpoint below.
 	type sourceMatch struct {
-		ep          scheduling.Endpoint
-		cached      int
-		blockSize   int
-		hasTierData bool
+		ep        scheduling.Endpoint
+		cached    int
+		blockSize int
 	}
 	maxCached := 0
 	var matches []sourceMatch
@@ -186,11 +175,11 @@ func (p *Producer) Produce(ctx context.Context, request *scheduling.InferenceReq
 		if ep.GetMetadata() == nil {
 			continue
 		}
-		cached, blockSize, hasTierData := p.sourceCachedTokens(ep)
+		cached, blockSize := p.sourceCachedTokens(ep)
 		if cached == 0 {
 			continue
 		}
-		matches = append(matches, sourceMatch{ep: ep, cached: cached, blockSize: blockSize, hasTierData: hasTierData})
+		matches = append(matches, sourceMatch{ep: ep, cached: cached, blockSize: blockSize})
 		if cached > maxCached {
 			maxCached = cached
 		}
@@ -198,7 +187,8 @@ func (p *Producer) Produce(ctx context.Context, request *scheduling.InferenceReq
 
 	best := bestMatchPeer{}
 	if maxCached > 0 {
-		var candidates []sourceMatch
+		var candidates []scheduling.Endpoint
+		var cachedCounts []int
 		var weights []float64
 		total := 0.0
 		for _, m := range matches {
@@ -206,7 +196,8 @@ func (p *Producer) Produce(ctx context.Context, request *scheduling.InferenceReq
 				continue
 			}
 			w := 1.0 / (1.0 + float64(waitingQueueSize(m.ep)))
-			candidates = append(candidates, m)
+			candidates = append(candidates, m.ep)
+			cachedCounts = append(cachedCounts, m.cached)
 			weights = append(weights, w)
 			total += w
 		}
@@ -220,28 +211,15 @@ func (p *Producer) Produce(ctx context.Context, request *scheduling.InferenceReq
 				}
 				target -= w
 			}
-			md := candidates[chosen].ep.GetMetadata()
+			md := candidates[chosen].GetMetadata()
 			best = bestMatchPeer{
 				hostPort:     net.JoinHostPort(md.Address, md.Port),
-				cachedTokens: candidates[chosen].cached,
-				hasTierData:  candidates[chosen].hasTierData,
+				cachedTokens: cachedCounts[chosen],
 			}
 		}
 	}
 	if best.cachedTokens > 0 {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
 		request.PutAttribute(p.attrKey(), &best)
-		if best.hasTierData {
-			reusableTokens := best.cachedTokens - p.minCachedTokenDelta + 1
-			if reusableTokens > 0 {
-				if err := ctx.Err(); err != nil {
-					return err
-				}
-				request.PutAttribute(p.reusablePrefixTokensDataKey, attrprefix.ReusablePrefixTokens(reusableTokens))
-			}
-		}
 	}
 	log.FromContext(ctx).WithName(p.typedName.String()).V(logging.TRACE).Info("Produce completed",
 		"requestID", request.RequestID, "endpoints", len(endpoints),
@@ -325,25 +303,26 @@ const cpuDeviceTier = "cpu"
 // so with per-tier data only the contiguous CPU-tier prefix counts; producers
 // without tier data are trusted as-is - the configured producer instance must
 // approximate the pull-servable (CPU) tier.
-func (p *Producer) sourceCachedTokens(ep scheduling.Endpoint) (tokens, blockSize int, hasTierData bool) {
+func (p *Producer) sourceCachedTokens(ep scheduling.Endpoint) (tokens, blockSize int) {
 	info := p.matchInfo(ep)
 	if info == nil {
-		return 0, 0, false
+		return 0, 0
 	}
 	if byTier := info.CachedBlocksByTier(); byTier != nil {
-		return byTier[cpuDeviceTier] * info.BlockSizeTokens(), info.BlockSizeTokens(), true
+		return byTier[cpuDeviceTier] * info.BlockSizeTokens(), info.BlockSizeTokens()
 	}
-	return info.CachedBlockCount() * info.BlockSizeTokens(), info.BlockSizeTokens(), false
+	return info.CachedBlockCount() * info.BlockSizeTokens(), info.BlockSizeTokens()
 }
 
-// cachedTokenCount returns the endpoint's confirmed cached prompt tokens
-// across all tiers, or 0 when its PrefixCacheMatchInfo is absent.
+// cachedTokenCount returns the endpoint's cached prompt tokens across all
+// tiers, or 0 when its PrefixCacheMatchInfo is absent. Local blocks need no
+// pull whatever their tier, so the computing side stays tier-blind.
 func (p *Producer) cachedTokenCount(ep scheduling.Endpoint) int {
 	info := p.matchInfo(ep)
 	if info == nil {
 		return 0
 	}
-	return info.ConfirmedCachedBlockCount() * info.BlockSizeTokens()
+	return info.CachedBlockCount() * info.BlockSizeTokens()
 }
 
 // matchInfo returns the endpoint's PrefixCacheMatchInfo, or nil when absent.

@@ -1,6 +1,5 @@
 /*
 Copyright 2025 The Kubernetes Authors.
-Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -55,12 +54,8 @@ type Runtime struct {
 	notification *notificationManager
 	endpoint     *endpointManager
 	extractors   *extractorMap
-
-	crossReplicaPub *crossReplicaPublisher
-
-	notificationSyncMu sync.RWMutex
-	// notificationSyncs remains nil until Start has registered every source.
-	notificationSyncs []*notificationInitialSync
+	syncer       fwkdl.CrossReplicaSyncer
+	syncInterval time.Duration
 
 	pendingMu            sync.Mutex
 	pendingRegistrations []fwkdl.PendingRegistration // code-registered (source-type, extractor) pairs, resolved by Configure()
@@ -103,6 +98,8 @@ func (r *Runtime) Configure(cfg *Config, logger logr.Logger) error {
 	numSources := 0
 	if cfg != nil {
 		numSources = len(cfg.Sources)
+		r.syncer = cfg.Syncer
+		r.syncInterval = cfg.SyncInterval
 	}
 	logger.Info("Configuring datalayer runtime", "numSources", numSources)
 
@@ -125,11 +122,14 @@ func (r *Runtime) Configure(cfg *Config, logger logr.Logger) error {
 	// extractor. Pending registrations consult this so code-registered defaults
 	// yield to user-config extractors of the same Type.
 	boundTypes := make(map[string]map[string]struct{})
-	markBound := func(srcName, extType string) {
+	boundInstances := make(map[string]map[fwkplugin.TypedName]struct{})
+	markBound := func(srcName string, identity fwkplugin.TypedName) {
 		if boundTypes[srcName] == nil {
 			boundTypes[srcName] = make(map[string]struct{})
+			boundInstances[srcName] = make(map[fwkplugin.TypedName]struct{})
 		}
-		boundTypes[srcName][extType] = struct{}{}
+		boundTypes[srcName][identity.Type] = struct{}{}
+		boundInstances[srcName][identity] = struct{}{}
 	}
 
 	gvk := newGvk()
@@ -169,12 +169,12 @@ func (r *Runtime) Configure(cfg *Config, logger logr.Logger) error {
 						return fmt.Errorf("dispatcher %s rejected extractor %s: %w",
 							src.TypedName(), ext.TypedName(), err)
 					}
-					markBound(srcName, ext.TypedName().Type)
+					markBound(srcName, ext.TypedName())
 				}
 			} else {
 				for _, ext := range srcCfg.Extractors {
 					r.extractors.Append(srcName, ext)
-					markBound(srcName, ext.TypedName().Type)
+					markBound(srcName, ext.TypedName())
 				}
 			}
 
@@ -224,9 +224,14 @@ func (r *Runtime) Configure(cfg *Config, logger logr.Logger) error {
 				pending.Extractor.TypedName(), srcName, err)
 		}
 
-		// Yield to user-config extractor of the same Type on this source.
-		extType := pending.Extractor.TypedName().Type
-		if _, alreadyBound := boundTypes[srcName][extType]; alreadyBound {
+		// A self-registering plugin needs its own named state attached. Defaults
+		// supplied on behalf of another plugin still yield by type.
+		identity := pending.Extractor.TypedName()
+		_, alreadyBound := boundInstances[srcName][identity]
+		if pending.Owner != identity {
+			_, alreadyBound = boundTypes[srcName][identity.Type]
+		}
+		if alreadyBound {
 			continue
 		}
 
@@ -238,11 +243,19 @@ func (r *Runtime) Configure(cfg *Config, logger logr.Logger) error {
 		} else {
 			r.extractors.Append(srcName, pending.Extractor)
 		}
-		markBound(srcName, extType)
+		markBound(srcName, identity)
 	}
 
-	if cfg != nil {
-		r.crossReplicaPub = newCrossReplicaPublisher(cfg.Syncer, r.extractors, cfg.SyncInterval, cfg.PublishTimeout)
+	// Register the cross-replica publisher as a polling source so the datalayer
+	// drives it per endpoint at its own interval, like any other dispatcher.
+	if pub := newCrossReplicaPublisher(r.syncer, r.extractors, r.syncInterval); pub != nil {
+		period, err := periodTicks(pub.Interval(), r.pollingInterval)
+		if err != nil {
+			return fmt.Errorf("cross-replica publisher: %w", err)
+		}
+		if err := r.dispatchers.Register(newIntervalDispatcher(pub, period)); err != nil {
+			return fmt.Errorf("register cross-replica publisher: %w", err)
+		}
 	}
 
 	logger.Info("Datalayer runtime configured",
@@ -390,16 +403,9 @@ func (r *Runtime) findSourceByType(sourceType string, gvkFilter *schema.GroupVer
 }
 
 // Start is called to enable the Runtime to start processing data collection. It wires
-// Kubernetes notifications into the manager and starts cross-replica syncing.
+// Kubernetes notifications into the manager.
 func (r *Runtime) Start(ctx context.Context, mgr ctrl.Manager) error {
-	r.notificationSyncMu.Lock()
-	r.notificationSyncs = nil
-	r.notificationSyncMu.Unlock()
-
-	r.StartCrossReplicaSync(ctx)
-
-	notificationSyncs := make([]*notificationInitialSync, 0, r.notification.Count())
-	err := r.notification.ForEach(func(srcName string, src fwkdl.NotificationSource) error {
+	return r.notification.ForEach(func(srcName string, src fwkdl.NotificationSource) error {
 		var extractors []fwkdl.NotificationExtractor
 		if rawExts, ok := r.extractors.Get(srcName); ok {
 			extractors = make([]fwkdl.NotificationExtractor, len(rawExts))
@@ -407,50 +413,11 @@ func (r *Runtime) Start(ctx context.Context, mgr ctrl.Manager) error {
 				extractors[i] = e.(fwkdl.NotificationExtractor)
 			}
 		}
-		initialSync, err := bindNotificationSource(src, extractors, mgr)
-		if err != nil {
+		if err := BindNotificationSource(src, extractors, mgr); err != nil {
 			return fmt.Errorf("failed to bind notification source %s: %w", src.TypedName(), err)
 		}
-		notificationSyncs = append(notificationSyncs, initialSync)
 		return nil
 	})
-	if err != nil {
-		return err
-	}
-
-	r.notificationSyncMu.Lock()
-	r.notificationSyncs = notificationSyncs
-	r.notificationSyncMu.Unlock()
-	return nil
-}
-
-// CheckReady reports readiness after Start has registered every notification
-// source and each source has processed its initial Kubernetes events.
-func (r *Runtime) CheckReady() error {
-	r.notificationSyncMu.RLock()
-	defer r.notificationSyncMu.RUnlock()
-
-	if r.notificationSyncs == nil {
-		return errors.New("notification sources have not been initialized")
-	}
-	for _, initialSync := range r.notificationSyncs {
-		if !initialSync.hasSynced() {
-			return fmt.Errorf("notification source %s has not processed its initial events", initialSync.tracker.Name())
-		}
-	}
-	return nil
-}
-
-func (*Runtime) TypedName() fwkplugin.TypedName {
-	return fwkplugin.TypedName{Type: "datalayer", Name: "runtime"}
-}
-
-// StartCrossReplicaSync starts the shared cross-replica publishing loop.
-func (r *Runtime) StartCrossReplicaSync(ctx context.Context) {
-	if r.crossReplicaPub == nil {
-		return
-	}
-	r.crossReplicaPub.start(ctx)
 }
 
 // NewEndpoint sets up data polling on the provided endpoint.
@@ -467,11 +434,6 @@ func (r *Runtime) NewEndpoint(ctx context.Context, endpointMetadata *fwkdl.Endpo
 		}
 		dispatchers = append(dispatchers, d)
 	}
-	key := endpointMetadata.GetID()
-	if r.crossReplicaPub != nil && !r.crossReplicaPub.registerEndpoint(key) {
-		logger.V(logging.DEFAULT).Info("endpoint already registered for cross-replica publishing", "endpoint", key)
-		return nil
-	}
 	if len(dispatchers) == 0 {
 		logger.Info("No polling sources configured, creating endpoint without collector")
 		r.dispatchEndpointEvent(ctx, logger, fwkdl.EndpointEvent{Type: fwkdl.EventAddOrUpdate, Endpoint: endpoint})
@@ -479,6 +441,8 @@ func (r *Runtime) NewEndpoint(ctx context.Context, endpointMetadata *fwkdl.Endpo
 	}
 
 	collector := NewCollector()
+
+	key := endpointMetadata.GetID()
 	if !r.collectors.Register(key, collector) {
 		logger.V(logging.DEFAULT).Info("collector already running for endpoint", "endpoint", key)
 		return nil
@@ -488,32 +452,21 @@ func (r *Runtime) NewEndpoint(ctx context.Context, endpointMetadata *fwkdl.Endpo
 	if err := collector.Start(ctx, ticker, endpoint, dispatchers); err != nil {
 		logger.Error(err, "failed to start collector for endpoint", "endpoint", key)
 		r.collectors.Remove(key)
-		if r.crossReplicaPub != nil {
-			if _, err := r.crossReplicaPub.delete(ctx, key); err != nil {
-				logger.Error(err, "failed to delete cross-replica state")
-			}
-		}
 		return nil
 	}
 
 	r.dispatchEndpointEvent(ctx, logger, fwkdl.EndpointEvent{Type: fwkdl.EventAddOrUpdate, Endpoint: endpoint})
-
 	return endpoint
 }
 
 // ReleaseEndpoint terminates polling for data on the given endpoint.
 func (r *Runtime) ReleaseEndpoint(ep fwkdl.Endpoint) {
+	r.dispatchEndpointEvent(context.Background(), r.logger, fwkdl.EndpointEvent{Type: fwkdl.EventDelete, Endpoint: ep})
+
 	key := ep.GetMetadata().GetID()
-	if r.crossReplicaPub != nil {
-		_, err := r.crossReplicaPub.delete(context.Background(), key)
-		if err != nil {
-			r.logger.Error(err, "failed to delete cross-replica state", "endpoint", key)
-		}
-	}
 	if collector, ok := r.collectors.Remove(key); ok {
 		collector.Stop()
 	}
-	r.dispatchEndpointEvent(context.Background(), r.logger, fwkdl.EndpointEvent{Type: fwkdl.EventDelete, Endpoint: ep})
 }
 
 // UpdateEndpoint dispatches an add/update lifecycle event for an existing endpoint.
@@ -548,8 +501,29 @@ func (r *Runtime) dispatchEndpointEvent(ctx context.Context, logger logr.Logger,
 				if err := epExt.Extract(ctx, *processed); err != nil {
 					logger.Error(err, "endpoint extractor failed", "extractor", ext.TypedName())
 				}
-				if r.crossReplicaPub != nil {
-					r.crossReplicaPub.handleEndpointEvent(ctx, *processed, ext)
+				if contributor, ok := ext.(fwkdl.CrossReplicaContributor); ok && r.syncer != nil {
+					spec := contributor.CrossReplicaState()
+					endpointID := processed.Endpoint.GetMetadata().GetNamespacedName().String()
+					if spec.SyncDisabled {
+						continue
+					}
+					switch processed.Type {
+					case fwkdl.EventAddOrUpdate:
+						processed.Endpoint.GetAttributes().Put(spec.AttributeKey, &fwkdl.DynamicAttribute{
+							Get: func() fwkdl.Cloneable {
+								if val, ok, _ := r.syncer.Get(ctx, spec.StateKey, endpointID, spec.Aggregate); ok {
+									if c, ok := val.(fwkdl.Cloneable); ok {
+										return c
+									}
+								}
+								return nil
+							},
+						})
+					case fwkdl.EventDelete:
+						if err := r.syncer.Delete(ctx, spec.StateKey, endpointID); err != nil {
+							logger.Error(err, "failed to delete shared state", "extractor", ext.TypedName(), "key", spec.StateKey)
+						}
+					}
 				}
 			}
 		}
@@ -639,4 +613,3 @@ func findUnique(sourceType string, hits ...sourceHit) (sourceHit, error) {
 
 var _ EndpointFactory = (*Runtime)(nil)
 var _ fwkdl.Registrar = (*Runtime)(nil)
-var _ fwkplugin.ReadinessChecker = (*Runtime)(nil)

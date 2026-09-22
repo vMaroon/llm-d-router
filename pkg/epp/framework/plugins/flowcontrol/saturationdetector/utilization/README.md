@@ -23,36 +23,19 @@ The global pool saturation is then evaluated across all candidate endpoints as a
     PoolSaturation = Average(EndpointScore)
 
 **Heterogeneous Deployments:** Because this detector calculates saturation as an unweighted average of individual endpoint scores, it treats all endpoints equally regardless of their physical capacity. In deployments with heterogeneous compute (e.g., mixing H100 and L4 nodes), a small, saturated endpoint has the exact same impact on global backpressure as a massive, saturated endpoint. Contrast this with the Concurrency Detector, which evaluates saturation as a single aggregate fraction, biasing toward larger endpoints.
-*Note: Endpoints with missing or stale metrics are scored according to `stalenessPolicy`: as 100% saturated under `saturated` (default), or excluded from the pool average under `ignore`. An empty candidate list reads 1.0 under both policies.*
+Missing or stale metrics contribute zero telemetry-based pressure, while the endpoint remains in the pool denominator. This is fail-open behavior, not evidence that the endpoint is idle. A fleet-wide metrics outage does not halt admission by itself. An empty endpoint pool still reports saturation 1.0 because no serving capacity exists.
 
-**Operational dependency:** under `saturated`, a fleet-wide scrape outage pins
-`flow_control_pool_saturation` at 1.0 and halts dispatch entirely. The `flow_control_stale_endpoints` gauge and a
-rate-limited detector log distinguish this from genuine overload: stale endpoints read exactly 1.0, while genuine
-oversubscription typically reads above 1.0. `saturated` is the default because admitting blind on missing
-data risks overloading model servers with no backpressure signal at all. Staleness also tends to correlate with
-overload: a server too busy to serve its metrics endpoint is often the one that is saturated, so `ignore`
-discounts the endpoints most likely to be overloaded from the backpressure signal. Deployments whose availability budget cannot absorb a dispatch halt
-during a metrics collection outage can select `ignore`, which excludes stale endpoints from the saturation
-average and scores an all-stale pool at 0.0, consistent with the Filter's fail-open fallback. Under `ignore`,
-a fleet-wide scrape outage means dispatching with no backpressure signal at all; the stale-endpoints gauge and
-detector log are the primary operational signal in that posture.
-
-`stalenessPolicy` governs the `SaturationDetector` role only. The `Filter` role always drops stale candidates
-and falls back to the original list when every candidate is stale, independent of this setting. Slow scrape
-cadences should be tuned with `metricsStalenessThreshold` rather than `ignore`: if the poll interval is
-longer than the staleness threshold, every sample reads stale between polls and `saturated` will block
-dispatch almost continuously. The policy field is an enum so additional degradations (for example, holding
-the last known score for a bounded window) can be added later.
+The `flow_control_stale_endpoints` gauge and rate-limited log identify telemetry loss. Fresh queue/KV measurements still contribute pressure. When used as the concurrency detector's `decodeSafety` floor, missing telemetry leaves logical request/token accounting in control. A standalone utilization detector has no such accounting fallback; during a full telemetry outage it cannot bound overload.
 
 ### Role in Scheduling (The Traffic Shaper)
-The detector implements the `Filter` interface to protect individual endpoints. It removes endpoints from candidate lists if their telemetry is stale, or if they exceed specific safety limits:
+The detector implements the `Filter` interface to protect individual endpoints. It removes endpoints from candidate lists when fresh telemetry exceeds specific safety limits. Missing or stale telemetry does not exclude an endpoint:
 
     MaxQueueLimit = QueueThreshold * (1 + Headroom)
     MaxKVCacheLimit = min(1.0, KVCacheThreshold * (1 + Headroom))
 
 This approach allows the Flow Controller to manage average pool load, while the Scheduler retains the flexibility to burst above ideal targets (the "Headroom") to satisfy affinity or scoring objectives.
 
-**Fail-Open Fallback:** To prevent complete routing failure, if *all* candidate endpoints are filtered out (i.e., the entire cluster is over the safety limits or stale), the filter softens and returns the original list of endpoints, allowing the scheduler's scorers to pick the least-bad option.
+**Fail-Open Fallback:** If all candidate endpoints exceed the safety limits, the filter returns the original list, allowing the scheduler's scorers to pick the least-bad option.
 
 ## Inputs consumed
 
@@ -67,8 +50,7 @@ The plugin accepts JSON parameters decoding to the following fields:
 
 - `queueDepthThreshold` (`int`): Target waiting queue depth limit. Serves as the "ideal" queue capacity for a single endpoint. Must be > 0. (Default: `5`)
 - `kvCacheUtilThreshold` (`float64`): Target KV cache memory utilization limit, expressed as a fraction. Must be in `(0.0, 1.0]`. (Default: `0.8`)
-- `metricsStalenessThreshold` (`string` / duration): Maximum age of metrics before an endpoint is considered stale. How stale endpoints are scored is controlled by `stalenessPolicy`. Must be > 0. (Default: `"200ms"`)
-- `stalenessPolicy` (`string`): How endpoints with missing or stale metrics contribute to pool saturation: `"saturated"` scores them as fully saturated; `"ignore"` excludes them from the saturation average. (Default: `"saturated"`)
+- `metricsStalenessThreshold` (`string` / duration): Maximum age of usable telemetry. Missing or stale metrics contribute no saturation pressure and do not exclude an endpoint. Must be > 0. (Default: `"200ms"`)
 - `headroom` (`float64`): Allowed burst capacity above the ideal thresholds, expressed as a fraction (e.g., `0.2` for 20%). Must be >= 0.0. (Default: `0.0`)
 
 ## Trade-offs

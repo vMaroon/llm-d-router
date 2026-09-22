@@ -1,6 +1,5 @@
 /*
 Copyright 2025 The Kubernetes Authors.
-Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -32,10 +31,7 @@ const (
 )
 
 // compile-time type assertion
-var (
-	_ fwksched.Scorer          = &RunningRequestsSizeScorer{}
-	_ fwkplugin.ConsumerPlugin = &RunningRequestsSizeScorer{}
-)
+var _ fwksched.Scorer = &RunningRequestsSizeScorer{}
 
 // RunningRequestsSizeScorerFactory defines the factory function for RunningRequestsSizeScorer.
 func RunningRequestsSizeScorerFactory(name string, _ *json.Decoder, _ fwkplugin.Handle) (fwkplugin.Plugin, error) {
@@ -65,13 +61,10 @@ func (s *RunningRequestsSizeScorer) Category() fwksched.ScorerCategory {
 	return fwksched.Distribution
 }
 
-// Consumes declares the scorer reads the running requests size from the
-// endpoint's Metrics struct, published by the core-metrics-extractor.
-func (s *RunningRequestsSizeScorer) Consumes() fwkplugin.DataDependencies {
-	return fwkplugin.DataDependencies{
-		Required: map[fwkplugin.DataKey]any{
-			fwkplugin.NewDataKey(metrics.RunningRequestsSizeKey, metrics.MetricsExtractorType): int(0),
-		},
+// Consumes returns the list of data that is consumed by the plugin.
+func (s *RunningRequestsSizeScorer) Consumes() map[string]any {
+	return map[string]any{
+		metrics.RunningRequestsSizeKey: int(0),
 	}
 }
 

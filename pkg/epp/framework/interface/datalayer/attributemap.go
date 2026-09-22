@@ -1,6 +1,5 @@
 /*
 Copyright 2025 The Kubernetes Authors.
-Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -48,10 +47,7 @@ func (d *DynamicAttribute) Clone() Cloneable {
 // Keys are DataKey values rather than strings so that a plugin can only reach
 // an attribute through a key it holds -- the same value it names in Produces()
 // or Consumes(). This removes the raw-string escape hatch by which a plugin
-// could read or write an attribute unrelated to its declaration. Put is the
-// canonical write entry point and is what Slot[T].Put calls; the slot is the
-// recommended path because it additionally pins the value type at compile
-// time.
+// could read or write an attribute unrelated to its declaration.
 type AttributeMap interface {
 	Put(fwkplugin.DataKey, Cloneable)
 	Get(fwkplugin.DataKey) (Cloneable, bool)

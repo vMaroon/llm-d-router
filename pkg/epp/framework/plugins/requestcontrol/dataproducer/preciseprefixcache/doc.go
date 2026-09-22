@@ -1,5 +1,4 @@
 /*
-Copyright 2025 The Kubernetes Authors.
 Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,6 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package preciseprefixcache hashes TokenizedRequest into KV-block keys,
+// Package preciseprefixcache hashes TokenizedPrompt into KV-block keys,
 // looks them up in the index, and writes per-endpoint PrefixCacheMatchInfo.
 package preciseprefixcache

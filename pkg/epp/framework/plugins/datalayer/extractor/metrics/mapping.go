@@ -1,6 +1,5 @@
 /*
 Copyright 2025 The Kubernetes Authors.
-Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -31,7 +30,7 @@ type Mapping struct {
 	KVCacheUtilization   *Spec
 	LoraRequestInfo      *LoRASpec
 	// CacheInfo is used for info-style gauge metrics where block_size and
-	// num_gpu_blocks are exposed as label values.
+	// num_gpu_blocks are exposed as label values (e.g. vLLM, trtllm-serve, SGLang).
 	CacheInfo *Spec
 	// CacheBlockSizeLabel and CacheNumBlocksLabel allow engines to use different
 	// label names for the CacheInfo metric. If empty, defaults to "block_size"
@@ -39,7 +38,8 @@ type Mapping struct {
 	CacheBlockSizeLabel string
 	CacheNumBlocksLabel string
 	// CacheBlockSize and CacheNumBlocks are used for engines that expose cache
-	// config as separate gauge values rather than labels on an info metric.
+	// config as separate gauge values rather than labels on an info metric
+	// (e.g. Triton TRT-LLM).
 	CacheBlockSize *Spec
 	CacheNumBlocks *Spec
 	CustomMetrics  []CustomMetric

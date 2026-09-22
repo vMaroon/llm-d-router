@@ -1,6 +1,5 @@
 /*
 Copyright 2025 The Kubernetes Authors.
-Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -80,7 +79,7 @@ func RegisterFeatureGate(gate string, isEnabledByDefault bool) {
 
 // LoadRawConfig parses the raw configuration bytes, applies initial defaults, and extracts feature gates.
 // It does not instantiate plugins.
-func LoadRawConfig(configBytes []byte, logger logr.Logger, extraGates ...string) (*configapi.EndpointPickerConfig, map[string]bool, error) {
+func LoadRawConfig(configBytes []byte, logger logr.Logger) (*configapi.EndpointPickerConfig, map[string]bool, error) {
 	var rawConfig *configapi.EndpointPickerConfig
 	var err error
 	if len(configBytes) != 0 {
@@ -94,7 +93,33 @@ func LoadRawConfig(configBytes []byte, logger logr.Logger, extraGates ...string)
 				"replacement", "llm-d.ai/v1alpha1/EndpointPickerConfig")
 		}
 
-		migrateDiscoveryConfig(logger, rawConfig)
+		//nolint:staticcheck // SA1019: rawConfig.SaturationDetector is deprecated: use flowControl.saturationDetector instead.
+		// If both are set, the new field is used. Tracked in https://github.com/llm-d/llm-d-router/issues/1308 (staticcheck)
+		if rawConfig.SaturationDetector != nil {
+			logger.Info("DEPRECATION: top-level saturationDetector is deprecated, use flowControl.saturationDetector instead. If both are set, the new field is used.")
+			if rawConfig.FlowControl == nil {
+				rawConfig.FlowControl = &configapi.FlowControlConfig{}
+			}
+			if rawConfig.FlowControl.SaturationDetector == nil {
+				//nolint:staticcheck // SA1019: rawConfig.SaturationDetector is deprecated: use flowControl.saturationDetector instead.
+				// If both are set, the new field is used. Tracked in https://github.com/llm-d/llm-d-router/issues/1308 (staticcheck)
+				rawConfig.FlowControl.SaturationDetector = rawConfig.SaturationDetector
+			}
+		}
+
+		//nolint:staticcheck // SA1019: rawConfig.Parser is deprecated: use requestHandler.parsers instead.
+		// If both are set, the new field is used. Tracked in https://github.com/llm-d/llm-d-router/issues/1308 (staticcheck)
+		if rawConfig.Parser != nil {
+			logger.Info("DEPRECATION: top-level parser is deprecated, use requestHandler.parsers instead. If both are set, the new field is used.")
+			if rawConfig.RequestHandler == nil {
+				rawConfig.RequestHandler = &configapi.RequestHandlerConfig{}
+			}
+			if len(rawConfig.RequestHandler.Parsers) == 0 {
+				//nolint:staticcheck // SA1019: rawConfig.Parser is deprecated: use requestHandler.parsers instead.
+				// If both are set, the new field is used. Tracked in https://github.com/llm-d/llm-d-router/issues/1308 (staticcheck)
+				rawConfig.RequestHandler.Parsers = []configapi.ParserConfig{*rawConfig.Parser}
+			}
+		}
 
 		logger.Info("Loaded raw configuration", "config", rawConfig.String())
 	} else {
@@ -104,16 +129,6 @@ func LoadRawConfig(configBytes []byte, logger logr.Logger, extraGates ...string)
 	}
 
 	applyStaticDefaults(rawConfig)
-
-	// Appended after the config's own entries because loadFeatureConfig is last-wins,
-	// so flag-supplied gates override file-supplied ones. This mutates rawConfig rather
-	// than only the returned map: InstantiateAndConfigure and validateConfig each
-	// re-derive gates from rawConfig.FeatureGates, and applying a gate to only one of
-	// the three leaves the EPP inconsistent.
-	if len(extraGates) > 0 {
-		rawConfig.FeatureGates = append(rawConfig.FeatureGates, extraGates...)
-		logger.Info("Applied feature gates from flags", "gates", extraGates)
-	}
 
 	// We validate gates early because they might dictate downstream loading logic.
 	if err := validateFeatureGates(rawConfig.FeatureGates); err != nil {
@@ -126,25 +141,6 @@ func LoadRawConfig(configBytes []byte, logger logr.Logger, extraGates ...string)
 	}
 
 	return rawConfig, featureConfig, nil
-}
-
-// migrateDiscoveryConfig lifts the deprecated bare pluginRef into the
-// consolidated discovery section:
-//
-//	dataLayer.discovery.pluginRef -> dataLayer.discovery.endpoints.pluginRef
-func migrateDiscoveryConfig(logger logr.Logger, rawConfig *configapi.EndpointPickerConfig) {
-	if rawConfig.DataLayer == nil {
-		return
-	}
-	dl := rawConfig.DataLayer
-
-	//nolint:staticcheck // SA1019: dl.Discovery.PluginRef is deprecated: use discovery.endpoints instead.
-	if dl.Discovery != nil && dl.Discovery.PluginRef != "" {
-		logger.Info("DEPRECATION: dataLayer.discovery.pluginRef is deprecated, use dataLayer.discovery.endpoints.pluginRef instead. If both are set, the new field is used.")
-		if dl.Discovery.Endpoints == nil {
-			dl.Discovery.Endpoints = &configapi.EndpointDiscoveryConfig{PluginRef: dl.Discovery.PluginRef}
-		}
-	}
 }
 
 // InstantiateAndConfigure performs the heavy lifting of plugin instantiation, system architecture injection, and
@@ -220,7 +216,6 @@ func InstantiateAndConfigure(
 		DataConfig:         dataConfig,
 		FlowControlConfig:  flowControlConfig,
 		ParserRegistry:     parserRegistry,
-		PropagatePriority:  rawConfig.RequestHandler.PropagatePriority,
 	}, nil
 }
 
@@ -233,9 +228,8 @@ func flowControlSettingsConfigured(fc *configapi.FlowControlConfig) bool {
 		return false
 	}
 	return fc.MaxBytes != nil || fc.MaxRequests != nil || fc.DefaultRequestTTL != nil ||
-		fc.NoEndpointRequestTTL != nil || fc.DefaultPriorityBand != nil ||
-		fc.DefaultNegativePriorityBand != nil || len(fc.PriorityBands) > 0 ||
-		fc.UsageLimitPolicyPluginRef != ""
+		fc.DefaultPriorityBand != nil || fc.DefaultNegativePriorityBand != nil ||
+		len(fc.PriorityBands) > 0 || fc.UsageLimitPolicyPluginRef != ""
 }
 
 func decodeRawConfig(configBytes []byte) (*configapi.EndpointPickerConfig, error) {
@@ -468,12 +462,6 @@ func buildDataLayerConfig(rawDataConfig *configapi.DataLayerConfig, handle fwkpl
 	if iv := rawDataConfig.CrossReplicaSyncInterval; iv != nil {
 		cfg.SyncInterval = iv.Duration
 	}
-	if timeout := rawDataConfig.CrossReplicaPublishTimeout; timeout != nil {
-		if timeout.Duration <= 0 {
-			return nil, fmt.Errorf("crossReplicaPublishTimeout must be positive, got %s", timeout.Duration)
-		}
-		cfg.PublishTimeout = timeout.Duration
-	}
 
 	for _, source := range rawDataConfig.Sources {
 		if sourcePlugin, ok := handle.Plugin(source.PluginRef).(fwkdl.DataSource); ok {
@@ -493,6 +481,5 @@ func buildDataLayerConfig(rawDataConfig *configapi.DataLayerConfig, handle fwkpl
 			return nil, fmt.Errorf("the plugin %s is not a fwkdl.DataSource", source.PluginRef)
 		}
 	}
-	handle.SetCrossReplicaSyncer(cfg.Syncer)
 	return &cfg, nil
 }

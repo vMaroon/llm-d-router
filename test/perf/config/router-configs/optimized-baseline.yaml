@@ -56,7 +56,7 @@ router:
       - "--log-level"
       - "warn"
       - "--concurrency"
-      - "32"
+      - "8"
       - "--drain-strategy"
       - "immediate"
       - "--drain-time-s"

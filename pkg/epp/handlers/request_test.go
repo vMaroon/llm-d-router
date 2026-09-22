@@ -1,6 +1,5 @@
 /*
 Copyright 2025 The Kubernetes Authors.
-Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -27,7 +26,6 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
-	grpcmetadata "google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/types/known/structpb"
 
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
@@ -94,26 +92,6 @@ func TestExtractTraceContext(t *testing.T) {
 			}
 		})
 	}
-}
-
-func TestExtractTraceContextPrefersHTTPHeadersOverGRPCMetadata(t *testing.T) {
-	otel.SetTextMapPropagator(propagation.TraceContext{})
-
-	const (
-		metadataTraceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0c9902b7-01"
-		headerTraceparent   = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
-	)
-	ctx := grpcmetadata.NewIncomingContext(context.Background(), grpcmetadata.Pairs("traceparent", metadataTraceparent))
-	req := &extProcPb.ProcessingRequest_RequestHeaders{
-		RequestHeaders: &extProcPb.HttpHeaders{
-			Headers: &configPb.HeaderMap{Headers: []*configPb.HeaderValue{{Key: "traceparent", Value: headerTraceparent}}},
-		},
-	}
-
-	sc := trace.SpanContextFromContext(extractTraceContext(ctx, req))
-
-	assert.True(t, sc.IsValid())
-	assert.Equal(t, "0af7651916cd43dd8448eb211c80319c", sc.TraceID().String())
 }
 
 func TestHandleRequestHeaders(t *testing.T) {
@@ -323,48 +301,26 @@ func TestFallbackToRandomEndpoint(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name               string
-		endpoint           *datalayer.EndpointMetadata
-		requestSize        int
-		wantTargetEndpoint string
-		wantBodyRespLen    int
+		name            string
+		requestSize     int
+		wantBodyRespLen int
 	}{
 		{
-			name: "IPv4 endpoint without body",
-			endpoint: &datalayer.EndpointMetadata{
-				Address: "1.2.3.4",
-				Port:    "80",
-			},
-			requestSize:        0,
-			wantTargetEndpoint: "1.2.3.4:80",
-			wantBodyRespLen:    0,
+			name:            "No body",
+			requestSize:     0,
+			wantBodyRespLen: 0,
 		},
 		{
-			name: "IPv6 endpoint without body",
-			endpoint: &datalayer.EndpointMetadata{
-				Address: "fd99:0:0:8::bec5",
-				Port:    "8000",
-			},
-			requestSize:        0,
-			wantTargetEndpoint: "[fd99:0:0:8::bec5]:8000",
-			wantBodyRespLen:    0,
-		},
-		{
-			name: "With body",
-			endpoint: &datalayer.EndpointMetadata{
-				Address: "1.2.3.4",
-				Port:    "80",
-			},
-			requestSize:        9,
-			wantTargetEndpoint: "1.2.3.4:80",
-			wantBodyRespLen:    1,
+			name:            "With body",
+			requestSize:     9,
+			wantBodyRespLen: 1,
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			server := &StreamingServer{
-				director: &mockDirectorRequest{endpoint: tc.endpoint},
+				director: &mockDirectorRequest{},
 			}
 			reqCtx := &RequestContext{
 				Request:  &Request{Headers: make(map[string]string), RawBody: []byte("test body")},
@@ -373,7 +329,6 @@ func TestFallbackToRandomEndpoint(t *testing.T) {
 
 			err := server.fallbackToRandomEndpoint(context.Background(), reqCtx, tc.requestSize)
 			assert.NoError(t, err)
-			assert.Equal(t, tc.wantTargetEndpoint, reqCtx.TargetEndpoint)
 
 			if tc.wantBodyRespLen > 0 {
 				assert.NotNil(t, reqCtx.reqBodyResp)
@@ -392,13 +347,9 @@ func TestFallbackToRandomEndpoint(t *testing.T) {
 
 type mockDirectorRequest struct {
 	Director
-	endpoint *datalayer.EndpointMetadata
 }
 
 func (m *mockDirectorRequest) GetRandomEndpoint() *datalayer.EndpointMetadata {
-	if m.endpoint != nil {
-		return m.endpoint
-	}
 	return &datalayer.EndpointMetadata{
 		Address: "1.2.3.4",
 		Port:    "80",

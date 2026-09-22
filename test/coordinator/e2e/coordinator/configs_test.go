@@ -59,7 +59,7 @@ pipeline:
 
 // coordinatorConfigNIXLGenerate is coordinatorConfigNIXL with OpenAI passthrough
 // disabled. With use_openai_format: false a chat/completions request collapses to
-// the native generate wire format on the encode and prefill steps, which build a
+// the native generate wire format on the encode and prefill legs, which build a
 // fresh sampling_params carrying only max_tokens: 1. This exercises a different
 // min_tokens-stripping path than the OpenAI clone-and-cap path.
 var coordinatorConfigNIXLGenerate = strings.Replace(
@@ -91,7 +91,7 @@ plugins:
     matchExpressions:
     - key: llm-d.ai/role
       operator: In
-      values: ["decode", "prefill-decode", "encode-prefill-decode"]
+      values: ["decode", "prefill-decode", "both", "encode-prefill-decode"]
 - type: queue-scorer
 - type: max-score-picker
 - type: header-profile-handler

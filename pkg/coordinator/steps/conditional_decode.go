@@ -19,17 +19,14 @@ package steps
 import (
 	"context"
 	"errors"
-	"fmt"
 	"maps"
 	"net/http"
 
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	logutil "github.com/llm-d/llm-d-router/pkg/common/observability/logging"
-	reqcommon "github.com/llm-d/llm-d-router/pkg/common/request"
 
 	"github.com/llm-d/llm-d-router/pkg/coordinator/gateway"
-	coordmetrics "github.com/llm-d/llm-d-router/pkg/coordinator/metrics"
 	"github.com/llm-d/llm-d-router/pkg/coordinator/pipeline"
 )
 
@@ -61,9 +58,7 @@ func (s *ConditionalDecodeStep) Execute(ctx context.Context, reqCtx *pipeline.Re
 	logger := log.FromContext(ctx).WithName(ConditionalDecodeStepName)
 
 	body := maps.Clone(reqCtx.Body)
-	if err := s.prepareBody(reqCtx, body, resolveFormat(s.useOpenAIFormat, reqCtx.OriginalPath)); err != nil {
-		return err
-	}
+	s.prepareBody(reqCtx, body)
 
 	logger.V(logutil.DEFAULT).Info("sending request", "path", reqCtx.OriginalPath)
 
@@ -73,19 +68,10 @@ func (s *ConditionalDecodeStep) Execute(ctx context.Context, reqCtx *pipeline.Re
 	}
 
 	var cacheMiss bool
-	transport := instrumentedTransport(s.gwClient.Transport(), coordmetrics.UpstreamConditionalDecode)
-	proxy, out := newDecodeProxy(logger, transport, func(resp *http.Response) error {
-		switch {
-		case resp.StatusCode == http.StatusPreconditionFailed:
+	proxy := newDecodeProxy(logger, s.gwClient.Transport(), func(resp *http.Response) error {
+		if resp.StatusCode == http.StatusPreconditionFailed {
 			cacheMiss = true
-			coordmetrics.IncConditionalDecodeProbes(coordmetrics.ProbeResultDeferred)
 			return errCacheMiss
-		case resp.StatusCode >= http.StatusBadRequest:
-			// Worker error (any 4xx/5xx except 412): the response is still
-			// streamed to the client, but the outcome is not a served hit.
-			coordmetrics.IncConditionalDecodeProbes(coordmetrics.ProbeResultError)
-		default:
-			coordmetrics.IncConditionalDecodeProbes(coordmetrics.ProbeResultServed)
 		}
 		return nil
 	})
@@ -95,31 +81,27 @@ func (s *ConditionalDecodeStep) Execute(ctx context.Context, reqCtx *pipeline.Re
 		logger.V(logutil.DEFAULT).Info("cache miss (412), continuing pipeline")
 		return nil
 	}
-	if out.TransportErr != nil {
-		coordmetrics.IncConditionalDecodeProbes(coordmetrics.ProbeResultTransportError)
-		return &pipeline.UpstreamStreamedError{Step: ConditionalDecodeStepName, Cause: out.TransportErr}
-	}
-	if out.Status >= http.StatusBadRequest {
-		return &pipeline.UpstreamStreamedError{Step: ConditionalDecodeStepName, StatusCode: out.Status}
-	}
 
 	logger.V(logutil.DEFAULT).Info("cache hit, response forwarded")
 	return pipeline.ErrPipelineDone
 }
 
-func (s *ConditionalDecodeStep) prepareBody(reqCtx *pipeline.RequestContext, body map[string]any, format reqcommon.APIType) error {
+func (s *ConditionalDecodeStep) prepareBody(reqCtx *pipeline.RequestContext, body map[string]any) {
+	format := resolveFormat(s.useOpenAIFormat, reqCtx.OriginalPath)
 	switch format {
-	case reqcommon.APITypeChatCompletions:
-		// The client's chat-completions body is forwarded as-is.
-	case reqcommon.APITypeCompletions:
+	case gateway.FormatChatCompletions:
+		if len(reqCtx.TokenIDs) > 0 {
+			tokens := map[string]any{
+				"token_ids": reqCtx.TokenIDs,
+			}
+			if features := buildMMFeatures(reqCtx.MultimodalEntries, false); features != nil {
+				tokens["features"] = features
+			}
+			body["tokens"] = tokens
+		}
+	case gateway.FormatCompletions:
 		if len(reqCtx.TokenIDs) > 0 {
 			body["prompt"] = reqCtx.TokenIDs
 		}
-	case reqcommon.APITypeGenerate:
-		// The client's generate body already carries token_ids.
-	default:
-		// resolveFormat only ever yields the three formats above.
-		return fmt.Errorf("conditional-decode: unsupported request format %v", format)
 	}
-	return nil
 }

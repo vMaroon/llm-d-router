@@ -22,8 +22,6 @@ import (
 	"time"
 
 	"github.com/spf13/viper"
-
-	"github.com/llm-d/llm-d-router/pkg/common/request"
 )
 
 type Config struct {
@@ -43,12 +41,6 @@ const DefaultMaxRequestBodySize = 64 // 64 MB
 
 type ServerConfig struct {
 	ListenAddr         string        `mapstructure:"listen_addr"`
-	MetricsPort        int           `mapstructure:"metrics_port"` // default 9090; non-positive disables the endpoint
-	MetricsCertDir     string        `mapstructure:"metrics_cert_dir"`
-	SecureCoordinator  bool          `mapstructure:"secure_coordinator"`
-	CertPath           string        `mapstructure:"cert_path"`
-	TLSMinVersion      string        `mapstructure:"tls_min_version"`
-	TLSCipherSuites    []string      `mapstructure:"tls_cipher_suites"`
 	ReadTimeout        time.Duration `mapstructure:"read_timeout"`
 	WriteTimeout       time.Duration `mapstructure:"write_timeout"`
 	ShutdownTimeout    time.Duration `mapstructure:"shutdown_timeout"`
@@ -63,11 +55,10 @@ type GatewayConfig struct {
 }
 
 type PipelineConfig struct {
-	KVConnector            string       `mapstructure:"kv_connector"`
-	ECConnector            string       `mapstructure:"ec_connector"`
-	UseOpenAIFormat        bool         `mapstructure:"use_openai_format"`
-	ForwardResponseHeaders []string     `mapstructure:"forward_response_headers"`
-	Steps                  []StepConfig `mapstructure:"steps"`
+	KVConnector     string       `mapstructure:"kv_connector"`
+	ECConnector     string       `mapstructure:"ec_connector"`
+	UseOpenAIFormat bool         `mapstructure:"use_openai_format"`
+	Steps           []StepConfig `mapstructure:"steps"`
 }
 
 type StepConfig struct {
@@ -84,12 +75,6 @@ func Load(path string) (*Config, error) {
 
 	v.SetDefault("log_level", 2)
 	v.SetDefault("server.listen_addr", ":8080")
-	v.SetDefault("server.metrics_port", 9090)
-	v.SetDefault("server.metrics_cert_dir", "")
-	v.SetDefault("server.secure_coordinator", true)
-	v.SetDefault("server.cert_path", "")
-	v.SetDefault("server.tls_min_version", "")
-	v.SetDefault("server.tls_cipher_suites", []string{})
 	v.SetDefault("server.read_timeout", 30*time.Second)
 	v.SetDefault("server.write_timeout", 120*time.Second)
 	v.SetDefault("server.shutdown_timeout", 25*time.Second)
@@ -98,7 +83,6 @@ func Load(path string) (*Config, error) {
 	v.SetDefault("gateway.idle_conn_timeout", 90*time.Second)
 	v.SetDefault("gateway.timeout", 60*time.Second)
 	v.SetDefault("pipeline.use_openai_format", true)
-	v.SetDefault("pipeline.forward_response_headers", []string{request.DisaggregatedRevisionHeaderKey})
 
 	if err := v.ReadInConfig(); err != nil {
 		return nil, fmt.Errorf("reading config: %w", err)

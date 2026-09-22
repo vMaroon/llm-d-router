@@ -20,7 +20,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net/http"
 
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -29,7 +28,6 @@ import (
 
 	"github.com/llm-d/llm-d-router/pkg/coordinator/connectors/kv"
 	"github.com/llm-d/llm-d-router/pkg/coordinator/gateway"
-	coordmetrics "github.com/llm-d/llm-d-router/pkg/coordinator/metrics"
 	"github.com/llm-d/llm-d-router/pkg/coordinator/pipeline"
 )
 
@@ -78,15 +76,8 @@ func (s *DecodeStep) Execute(ctx context.Context, reqCtx *pipeline.RequestContex
 		return err
 	}
 
-	transport := instrumentedTransport(s.gwClient.Transport(), coordmetrics.UpstreamDecode)
-	proxy, out := newDecodeProxy(logger, transport, nil)
+	proxy := newDecodeProxy(logger, s.gwClient.Transport(), nil)
 	proxy.ServeHTTP(reqCtx.ResponseWriter, proxyReq)
-	if out.TransportErr != nil {
-		return &pipeline.UpstreamStreamedError{Step: DecodeStepName, Cause: out.TransportErr}
-	}
-	if out.Status >= http.StatusBadRequest {
-		return &pipeline.UpstreamStreamedError{Step: DecodeStepName, StatusCode: out.Status}
-	}
 	return nil
 }
 
@@ -102,14 +93,15 @@ func (s *DecodeStep) prepareDecodeBody(ctx context.Context, reqCtx *pipeline.Req
 
 	format := resolveFormat(s.useOpenAIFormat, reqCtx.OriginalPath)
 	switch format {
-	case reqcommon.APITypeChatCompletions:
+	case gateway.FormatChatCompletions:
 		reqCtx.Body[reqcommon.FieldKVTransferParams] = kvParams
-	case reqcommon.APITypeCompletions:
+		s.injectTokensField(reqCtx)
+	case gateway.FormatCompletions:
 		reqCtx.Body[reqcommon.FieldKVTransferParams] = kvParams
 		if len(reqCtx.TokenIDs) > 0 {
 			reqCtx.Body["prompt"] = reqCtx.TokenIDs
 		}
-	case reqcommon.APITypeGenerate:
+	case gateway.FormatGenerate:
 		// The /inference/v1/generate engine reads transfer params only from
 		// sampling_params.extra_args; a top-level kv_transfer_params is ignored,
 		// so the decode worker never pulls the prefill KV over NIXL. Merge into
@@ -121,6 +113,16 @@ func (s *DecodeStep) prepareDecodeBody(ctx context.Context, reqCtx *pipeline.Req
 		}
 		setGenerateTransferParams(sampling, kvParams, nil)
 	}
+}
+
+func (s *DecodeStep) injectTokensField(reqCtx *pipeline.RequestContext) {
+	tokens := map[string]any{
+		"token_ids": reqCtx.TokenIDs,
+	}
+	if features := buildMMFeatures(reqCtx.MultimodalEntries, false); features != nil {
+		tokens["features"] = features
+	}
+	reqCtx.Body["tokens"] = tokens
 }
 
 func (s *DecodeStep) injectUUIDs(reqCtx *pipeline.RequestContext) {

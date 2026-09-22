@@ -15,76 +15,91 @@ limitations under the License.
 */
 
 // Package tokenizer provides a DataProducer plugin that tokenizes the request
-// prompt and publishes the result on InferenceRequestBody.TokenizedRequest for
+// prompt and publishes the result on InferenceRequestBody.TokenizedPrompt for
 // downstream consumers (scorers, filters, other data producers).
 package tokenizer
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
+	kvctok "github.com/llm-d/llm-d-kv-cache/pkg/tokenization"
 	"github.com/llm-d/llm-d-router/pkg/kvcache/kvblock"
 	"github.com/llm-d/llm-d-router/pkg/kvcache/tokenization"
 	tokenizerTypes "github.com/llm-d/llm-d-router/pkg/kvcache/tokenization/types"
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/codes"
-	"go.opentelemetry.io/otel/trace"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	"github.com/llm-d/llm-d-router/pkg/common/observability/semconv"
-	"github.com/llm-d/llm-d-router/pkg/common/observability/tracing"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
 	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
-	mmobs "github.com/llm-d/llm-d-router/pkg/epp/framework/observability/multimodal"
 	sourcenotifications "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/source/notifications"
-	rcplugins "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol"
-	"github.com/llm-d/llm-d-router/pkg/epp/metadata"
 )
 
 type tokenizer interface {
 	Render(ctx context.Context, payload fwkrh.RequestPayload) ([][]uint32, [][]tokenizerTypes.Offset, error)
 	RenderChat(ctx context.Context, payload fwkrh.RequestPayload) ([]uint32, *tokenization.MultiModalFeatures, error)
-	RenderMessages(ctx context.Context, payload fwkrh.RequestPayload) ([]uint32, *tokenization.MultiModalFeatures, error)
 }
 
 const (
 	// PluginType is the canonical type name used to register the plugin.
 	PluginType = "token-producer"
 
+	// LegacyPluginType is the previous type name. Existing YAML configs that
+	// reference it continue to work. Will be removed in a future release.
+	//
+	// Deprecated: use PluginType ("token-producer") instead.
+	LegacyPluginType = "tokenizer"
+
 	tokenizedPromptKeyID = "TokenizedPrompt"
+
+	// anthropicBillingHeaderPrefix marks Claude Code system text that carries a
+	// per-request hash; vLLM strips it server-side, so the tokenizer must too.
+	anthropicBillingHeaderPrefix = "x-anthropic-billing-header"
+
+	// defaultImageMediaType fills in Anthropic base64 image sources with no
+	// media_type, matching vLLM's conversion.
+	defaultImageMediaType = "image/jpeg"
 )
 
-// Backend identifiers reported on the tokenize span.
+// Content-block types the Anthropic Messages conversion reads and emits.
 const (
-	backendVLLM     = "vllm"
-	backendEstimate = "estimate"
+	blockTypeText             = "text"
+	blockTypeImage            = "image"
+	blockTypeImageURL         = "image_url"
+	blockTypeThinking         = "thinking"
+	blockTypeRedactedThinking = "redacted_thinking"
+	blockTypeToolUse          = "tool_use"
+	blockTypeToolResult       = "tool_result"
 )
-
-// resultSkippedNoTokens marks a tokenize span whose backend returned no tokens,
-// distinguishing it from a span missing attributes for any other reason.
-const resultSkippedNoTokens = "skipped_no_tokens"
 
 var TokenizedPromptDataKey = plugin.NewDataKey(tokenizedPromptKeyID, PluginType)
 
 // tokenizerPluginConfig holds the configuration for the tokenizer plugin.
 //
 // Backend selection: `vllm` or `modelName` selects the vLLM HTTP /render
-// backend; `estimate` selects the tokenizer-free byte-packing backend, which is
-// also the zero-config default when no backend is set.
+// backend; `udsTokenizerConfig` selects the deprecated gRPC-over-UDS backend;
+// `estimate` selects the tokenizer-free byte-packing backend, which is also the
+// zero-config default when no backend is set.
 type tokenizerPluginConfig struct {
+	// TokenizerConfig configures the deprecated gRPC-over-UDS backend.
+	//
+	// Deprecated: the UDS tokenizer backend is deprecated and will be removed
+	// in a future release. Migrate to the `vllm` HTTP /render backend.
+	TokenizerConfig kvctok.UdsTokenizerConfig `json:"udsTokenizerConfig,omitempty"`
 	// VLLM configures the vLLM /render backend.
 	VLLM *vllmConfig `json:"vllm,omitempty"`
 	// Estimate selects the tokenizer-free byte-packing backend; mutually
-	// exclusive with 'vllm' and needs no 'modelName'.
+	// exclusive with 'vllm'/'udsTokenizerConfig' and needs no 'modelName'.
 	Estimate *estimateConfig `json:"estimate,omitempty"`
-	// ModelName is used for startup probes, native gRPC text, and legacy Messages.
-	// Native HTTP rendering keeps the effective model, including aliases and adapters.
+	// ModelName is the name of the model whose tokenizer should be loaded.
 	ModelName string `json:"modelName"`
 }
 
@@ -217,13 +232,14 @@ func PluginFactory(name string, rawParameters *json.Decoder, handle plugin.Handl
 	}
 
 	estimate := config.Estimate != nil
+	uds := config.TokenizerConfig.IsEnabled()
 	vllm := config.VLLM != nil || config.ModelName != ""
-	if estimate && vllm {
-		return nil, fmt.Errorf("invalid configuration for '%s' plugin: only one of 'estimate' or 'vllm' may be set", PluginType)
+	if (estimate && (uds || vllm)) || (uds && vllm) {
+		return nil, fmt.Errorf("invalid configuration for '%s' plugin: only one of 'estimate', 'vllm', or 'udsTokenizerConfig' may be set", PluginType)
 	}
-	// modelName is required only by the real-tokenizer backend; the zero-config
+	// modelName is required only by the real-tokenizer backends; the zero-config
 	// path selects the estimate backend, which needs none.
-	if vllm && config.ModelName == "" {
+	if (uds || vllm) && config.ModelName == "" {
 		return nil, fmt.Errorf("invalid configuration for '%s' plugin: 'modelName' must be specified", PluginType)
 	}
 	if config.Estimate != nil && config.Estimate.Image != nil {
@@ -253,47 +269,64 @@ func PluginFactory(name string, rawParameters *json.Decoder, handle plugin.Handl
 	return p, nil
 }
 
-// NewPlugin constructs the configured backend: vllm /render (selected by
-// 'vllm' or 'modelName'), or estimate byte-packing (the default when no
-// backend is set).
+// LegacyPluginFactory wraps PluginFactory for the deprecated `tokenizer` type
+// name. It logs a one-time-per-instantiation deprecation warning and delegates
+// to PluginFactory. Will be removed when LegacyPluginType is removed.
+//
+// Deprecated: register PluginType ("token-producer") instead.
+func LegacyPluginFactory(name string, rawParameters *json.Decoder, handle plugin.Handle) (plugin.Plugin, error) {
+	log.FromContext(handle.Context()).Info(
+		"DEPRECATION: plugin type '"+LegacyPluginType+"' is deprecated; use '"+PluginType+"' instead",
+		"pluginName", name,
+	)
+	return PluginFactory(name, rawParameters, handle)
+}
+
+// NewPlugin constructs the configured backend: udsTokenizerConfig (deprecated),
+// vllm /render (selected by 'vllm' or 'modelName'), or estimate byte-packing
+// (the default when no backend is set).
 func NewPlugin(ctx context.Context, name string, config *tokenizerPluginConfig) (*Plugin, error) {
-	var backend tokenInputProducer
-	var backendName string
 	var endpointPicker *discoveredEndpointPicker
+	var backend tokenInputProducer
 	switch {
+	case config.TokenizerConfig.IsEnabled():
+		log.FromContext(ctx).Info(
+			"DEPRECATION: the 'udsTokenizerConfig' parameter is deprecated and will be removed in a future release; set the 'vllm' parameter instead (see plugin README)",
+			"pluginType", PluginType,
+		)
+		uds, err := newUDSTokenizer(ctx, &config.TokenizerConfig, config.ModelName)
+		if err != nil {
+			return nil, fmt.Errorf("failed to initialize UDS tokenizer for '%s' plugin - %w", PluginType, err)
+		}
+		backend = renderBackend{tk: uds}
 	case config.VLLM != nil || config.ModelName != "":
 		cfg := config.VLLM
 		if cfg == nil {
 			cfg = &vllmConfig{}
 		}
-		renderer, err := newVLLMHTTPRenderer(cfg)
+		renderer, err := newVLLMHTTPRenderer(cfg, config.ModelName)
 		if err != nil {
 			return nil, fmt.Errorf("failed to initialize vLLM HTTP renderer for '%s' plugin - %w", PluginType, err)
 		}
-		legacyMessages, err := configureLegacyMessages(ctx, name, cfg.MessagesRenderMode)
-		if err != nil {
-			return nil, err
+		backend = renderBackend{
+			tk:                         renderer,
+			mergeAnthropicInlineSystem: cfg.MergeAnthropicInlineSystem,
 		}
-		backend = renderBackend{tk: renderer, modelName: config.ModelName, legacyMessages: legacyMessages, warmupAuth: vllmWarmupAuthHeader()}
-		backendName = backendVLLM
 		endpointPicker, _ = renderer.endpointPicker.(*discoveredEndpointPicker)
 		if endpointPicker != nil && endpointPicker.config.DiscoverModelLimits {
 			go endpointPicker.watchModelLimits(ctx, renderer.client, config.ModelName)
 		}
 	default:
 		backend = estimateBackend{img: newImageEstimator(config.Estimate), vid: newVideoEstimator(config.Estimate)}
-		backendName = backendEstimate
 	}
 
-	typedName := plugin.TypedName{Type: PluginType, Name: name}
 	p := &Plugin{
-		typedName:   typedName,
-		backend:     backend,
-		backendName: backendName,
-		dk:          TokenizedPromptDataKey.WithNonEmptyProducerName(name),
+		typedName: plugin.TypedName{Type: PluginType, Name: name},
+		backend:   backend,
+		dk:        TokenizedPromptDataKey.WithNonEmptyProducerName(name),
 	}
 	if endpointPicker != nil {
-		p.endpointDiscovery = newEndpointDiscoveryHandler(typedName, endpointPicker)
+		p.endpointDiscovery = newEndpointDiscoveryHandler(p.TypedName(), endpointPicker)
 	}
 	if w, ok := backend.(warmer); ok {
 		go w.warmup(ctx)
@@ -302,34 +335,14 @@ func NewPlugin(ctx context.Context, name string, config *tokenizerPluginConfig) 
 }
 
 // Plugin tokenizes the prompt in the incoming request and writes the result to
-// InferenceRequestBody.TokenizedRequest for downstream DataProducer / scoring plugins.
+// InferenceRequestBody.TokenizedPrompt for downstream DataProducer / scoring plugins.
 type Plugin struct {
-	typedName plugin.TypedName
-	backend   tokenInputProducer
-	// backendName identifies the configured backend on the tokenize span.
-	backendName       string
-	dk                plugin.DataKey
 	endpointDiscovery *endpointDiscoveryHandler
+	typedName         plugin.TypedName
+	backend           tokenInputProducer
+	dk                plugin.DataKey
 }
 
-// compile-time assertions.
-var (
-	_ requestcontrol.DataProducer         = &Plugin{}
-	_ requestcontrol.TimeoutAwareProducer = &Plugin{}
-	_ datalayer.Registrant                = &Plugin{}
-)
-
-// TypedName returns the typed name of the plugin.
-func (p *Plugin) TypedName() plugin.TypedName {
-	return p.typedName
-}
-
-// Produces returns the data keys this plugin produces.
-func (p *Plugin) Produces() map[plugin.DataKey]any {
-	return map[plugin.DataKey]any{p.dk: fwkrh.TokenizedRequest{}}
-}
-
-// RegisterDependencies wires discovery-backed renderers to endpoint lifecycle events.
 func (p *Plugin) RegisterDependencies(r datalayer.Registrar) error {
 	if p.endpointDiscovery == nil {
 		return nil
@@ -342,6 +355,22 @@ func (p *Plugin) RegisterDependencies(r datalayer.Registrar) error {
 	})
 }
 
+// compile-time assertions.
+var (
+	_ requestcontrol.DataProducer         = &Plugin{}
+	_ requestcontrol.TimeoutAwareProducer = &Plugin{}
+)
+
+// TypedName returns the typed name of the plugin.
+func (p *Plugin) TypedName() plugin.TypedName {
+	return p.typedName
+}
+
+// Produces returns the data keys this plugin produces.
+func (p *Plugin) Produces() map[plugin.DataKey]any {
+	return map[plugin.DataKey]any{p.dk: fwkrh.TokenizedPrompt{}}
+}
+
 // ProduceTimeout surfaces the backend's render timeout when it manages one, so
 // the director extends the data-producer budget past its default. Returns 0 to
 // keep the default (e.g. the estimate backend, which is in-memory).
@@ -352,78 +381,389 @@ func (p *Plugin) ProduceTimeout() time.Duration {
 	return 0
 }
 
-// Produce derives the request's TokenizedRequest via the configured backend and
+// Produce derives the request's TokenizedPrompt via the configured backend and
 // stores it on the body. Skips when one is already present; errors propagate to
 // the Director, which logs and continues.
-//
-// The tokenize span opens below the already-tokenized skip path, so it is
-// emitted only when the backend is actually invoked.
 func (p *Plugin) Produce(ctx context.Context, request *scheduling.InferenceRequest, _ []scheduling.Endpoint) error {
 	if request.Body == nil {
 		return errors.New("request body is nil")
 	}
-	if request.Body.RenderRequest {
-		return nil
-	}
-	if request.Body.TokenizedRequest != nil {
+	if request.Body.TokenizedPrompt != nil {
 		// A parser (e.g. vLLM gRPC) may pre-populate tokens without a salt;
 		// ensure cache-salt isolation still applies on the skip path.
-		if request.Body.TokenizedRequest.CacheSalt == "" {
-			request.Body.TokenizedRequest.CacheSalt = CacheSaltFromBody(request.Body)
+		if request.Body.TokenizedPrompt.CacheSalt == "" {
+			request.Body.TokenizedPrompt.CacheSalt = CacheSaltFromBody(request.Body)
 		}
 		return nil
 	}
 
 	ctx = withMMMetadata(ctx, parseMMMetadataHeaders(request.Headers))
-	if auth, ok := metadata.GetLowerCaseHeaderValue(request.Headers, "authorization"); ok {
-		ctx = withAuthHeader(ctx, auth)
-	}
-
-	ctx, span := tracing.Tracer(rcplugins.TracerScope).Start(ctx, "tokenize",
-		trace.WithSpanKind(trace.SpanKindInternal),
-	)
-	defer span.End()
-	// On the default (tracing-disabled) path Start returns a non-recording span;
-	// skip attribute construction, which walks the request's multimodal features.
-	tracingActive := span.IsRecording()
-	if tracingActive {
-		attrs := []attribute.KeyValue{
-			semconv.LLMDEPPTokenProducerBackend(p.backendName),
-		}
-		if request.TargetModel != "" {
-			attrs = append(attrs, semconv.GenAIRequestModel(request.TargetModel))
-		}
-		if request.RequestID != "" {
-			attrs = append(attrs, semconv.GenAIRequestID(request.RequestID))
-		}
-		span.SetAttributes(attrs...)
-	}
-
 	tp, err := p.backend.produce(ctx, request.Body)
 	if err != nil {
-		span.SetStatus(codes.Error, err.Error())
 		return err
 	}
 	if tp == nil || tp.TokenCount() == 0 {
-		if tracingActive {
-			span.SetAttributes(semconv.LLMDEPPTokenProducerResult(resultSkippedNoTokens))
-		}
 		return nil
 	}
 	tp.CacheSalt = CacheSaltFromBody(request.Body)
-	request.Body.TokenizedRequest = tp
-
-	if tracingActive {
-		span.SetAttributes(append(mmobs.SpanAttributes(request),
-			semconv.LLMDEPPTokenProducerTokenCount(tp.TokenCount()),
-		)...)
-	}
+	request.Body.TokenizedPrompt = tp
 	return nil
 }
 
+// ChatCompletionsToRenderChatRequest converts a ChatCompletionsRequest to a
+// tokenization RenderChatRequest, including multimodal content blocks.
+func ChatCompletionsToRenderChatRequest(chat *fwkrh.ChatCompletionsRequest) *tokenizerTypes.RenderChatRequest {
+	conversation := make([]tokenizerTypes.Conversation, 0, len(chat.Messages))
+	for _, msg := range chat.Messages {
+		conv := tokenizerTypes.Conversation{
+			Role:      msg.Role,
+			Content:   &tokenizerTypes.Content{Raw: msg.Content.Raw},
+			ToolCalls: msg.ToolCalls,
+		}
+		for _, block := range msg.Content.Structured {
+			conv.Content.Structured = append(conv.Content.Structured, tokenizerTypes.ContentBlock{
+				Type:     block.Type,
+				Text:     block.Text,
+				ImageURL: tokenizerTypes.ImageBlock{URL: block.ImageURL.URL},
+			})
+		}
+		conversation = append(conversation, conv)
+	}
+
+	return &tokenizerTypes.RenderChatRequest{
+		Conversation:              conversation,
+		Tools:                     chat.Tools,
+		Documents:                 chat.Documents,
+		ChatTemplate:              chat.ChatTemplate,
+		ReturnAssistantTokensMask: chat.ReturnAssistantTokensMask,
+		ContinueFinalMessage:      chat.ContinueFinalMessage,
+		AddGenerationPrompt:       chat.AddGenerationPrompt,
+		ChatTemplateKWArgs:        chat.ChatTemplateKWArgs,
+	}
+}
+
+// MessagesToRenderChatRequest converts an Anthropic MessagesRequest into the
+// OpenAI chat shape vLLM builds when serving /v1/messages, so the render
+// backend and the server apply the identical chat-template pipeline to the
+// same request and prefix-cache blocks line up.
+func MessagesToRenderChatRequest(msg *fwkrh.MessagesRequest) *tokenizerTypes.RenderChatRequest {
+	return messagesToRenderChatRequest(msg, false)
+}
+
+func messagesToRenderChatRequest(msg *fwkrh.MessagesRequest, mergeInlineSystem bool) *tokenizerTypes.RenderChatRequest {
+	conversation := make([]tokenizerTypes.Conversation, 0, 1+len(msg.Messages))
+
+	var system strings.Builder
+	system.WriteString(anthropicSystemText(msg.System))
+	if mergeInlineSystem {
+		for _, m := range msg.Messages {
+			if m.Role == "system" {
+				system.WriteString(anthropicInlineSystemText(m.Content))
+			}
+		}
+	}
+	if system.Len() > 0 {
+		conversation = append(conversation, tokenizerTypes.Conversation{
+			Role:    "system",
+			Content: &tokenizerTypes.Content{Raw: system.String()},
+		})
+	}
+
+	for _, m := range msg.Messages {
+		if m.Role == "system" {
+			if mergeInlineSystem {
+				continue
+			}
+			// Not valid Anthropic input; tolerated the way vLLM does.
+			if text := anthropicInlineSystemText(m.Content); text != "" {
+				conversation = append(conversation, tokenizerTypes.Conversation{
+					Role:    "system",
+					Content: &tokenizerTypes.Content{Raw: text},
+				})
+			}
+			continue
+		}
+		conversation = appendAnthropicMessage(conversation, m)
+	}
+
+	return &tokenizerTypes.RenderChatRequest{
+		Conversation: conversation,
+		Tools:        convertAnthropicTools(msg.Tools),
+	}
+}
+
+// anthropicSystemText joins the system prompt's text blocks with no
+// separator, dropping Claude Code's per-request billing header so it does not
+// defeat prefix caching (mirrors vLLM).
+func anthropicSystemText(ac fwkrh.AnthropicContent) string {
+	if ac.Raw != "" {
+		return ac.Raw
+	}
+	var sb strings.Builder
+	for _, block := range ac.Structured {
+		if block.Type == blockTypeText && block.Text != "" && !strings.HasPrefix(block.Text, anthropicBillingHeaderPrefix) {
+			sb.WriteString(block.Text)
+		}
+	}
+	return sb.String()
+}
+
+func anthropicInlineSystemText(ac fwkrh.AnthropicContent) string {
+	if ac.Raw != "" {
+		if strings.HasPrefix(ac.Raw, anthropicBillingHeaderPrefix) {
+			return ""
+		}
+		return ac.Raw
+	}
+	return anthropicSystemText(ac)
+}
+
+// appendAnthropicMessage appends the conversations for one message. User
+// tool_result blocks append their tool messages immediately, so those precede
+// the user message that carried them - the order vLLM emits.
+func appendAnthropicMessage(conversation []tokenizerTypes.Conversation, m fwkrh.AnthropicMessage) []tokenizerTypes.Conversation {
+	if m.Content.Raw != "" {
+		return append(conversation, tokenizerTypes.Conversation{
+			Role:    m.Role,
+			Content: &tokenizerTypes.Content{Raw: m.Content.Raw},
+		})
+	}
+
+	var contentBlocks []tokenizerTypes.ContentBlock
+	var toolCalls []any
+	var reasoning strings.Builder
+	for _, b := range m.Content.Structured {
+		switch b.Type {
+		case blockTypeText:
+			if b.Text != "" {
+				contentBlocks = append(contentBlocks, tokenizerTypes.ContentBlock{Type: blockTypeText, Text: b.Text})
+			}
+		case blockTypeImage:
+			contentBlocks = appendImageBlock(contentBlocks, b.Source)
+		case blockTypeThinking:
+			reasoning.WriteString(b.Thinking)
+		case blockTypeRedactedThinking:
+			// Opaque safety-filtered reasoning; parses but contributes no tokens.
+		case blockTypeToolUse:
+			toolCalls = append(toolCalls, anthropicToolCall(b))
+		case blockTypeToolResult:
+			if m.Role == "user" {
+				conversation = appendAnthropicToolResult(conversation, b)
+			} else {
+				text, _ := anthropicToolResultContent(b)
+				contentBlocks = append(contentBlocks, tokenizerTypes.ContentBlock{
+					Type: blockTypeText,
+					Text: "Tool result: " + text,
+				})
+			}
+		}
+	}
+
+	conv := tokenizerTypes.Conversation{Role: m.Role}
+	if reasoning.Len() > 0 {
+		conv.Reasoning = reasoning.String()
+	}
+	conv.ToolCalls = toolCalls
+	switch {
+	case len(contentBlocks) == 1 && contentBlocks[0].Type == blockTypeText:
+		conv.Content = &tokenizerTypes.Content{Raw: contentBlocks[0].Text}
+	case len(contentBlocks) > 0:
+		conv.Content = &tokenizerTypes.Content{Structured: contentBlocks}
+	}
+	// A user message reduced to bare tool_results has no content of its own;
+	// its tool messages were already appended above.
+	if m.Role == "user" && conv.Content == nil {
+		return conversation
+	}
+	return append(conversation, conv)
+}
+
+// appendImageBlock maps an Anthropic image source to an OpenAI image_url
+// content block; sources that resolve to no URL are dropped.
+func appendImageBlock(blocks []tokenizerTypes.ContentBlock, src *fwkrh.AnthropicImageSource) []tokenizerTypes.ContentBlock {
+	if url := anthropicImageToURL(src); url != "" {
+		blocks = append(blocks, tokenizerTypes.ContentBlock{
+			Type:     blockTypeImageURL,
+			ImageURL: tokenizerTypes.ImageBlock{URL: url},
+		})
+	}
+	return blocks
+}
+
+// anthropicToolCall converts a tool_use block into an OpenAI function tool
+// call. Arguments are CPython json.dumps formatted (separators, ASCII
+// escaping, forwarded key order) - the exact string vLLM renders into the
+// prompt after EPP repackage.
+func anthropicToolCall(b fwkrh.AnthropicContentBlock) map[string]any {
+	id := b.ID
+	if id == "" {
+		// vLLM falls back to call_<unix-time>; a fixed stand-in only keeps the
+		// rendered length stable (ids are generated in practice).
+		id = "call_0000000000"
+	}
+	return map[string]any{
+		"id":   id,
+		"type": "function",
+		"function": map[string]any{
+			"name":      b.Name,
+			"arguments": pythonArguments(b.Input),
+		},
+	}
+}
+
+// pythonArguments renders tool_use input as json.dumps(input or {}): absent,
+// null, and empty-object inputs all render as "{}".
+func pythonArguments(raw json.RawMessage) string {
+	switch string(bytes.TrimSpace(raw)) {
+	case "", "null", "{}":
+		return "{}"
+	}
+	raw = canonicalizeRepackagedJSON(raw)
+	if out, err := pythonDumps(raw); err == nil {
+		return out
+	}
+	return "{}"
+}
+
+// appendAnthropicToolResult appends a tool-role message for a user
+// tool_result block; images in the result follow as their own user message.
+func appendAnthropicToolResult(conversation []tokenizerTypes.Conversation, b fwkrh.AnthropicContentBlock) []tokenizerTypes.Conversation {
+	text, imageBlocks := anthropicToolResultContent(b)
+	conversation = append(conversation, tokenizerTypes.Conversation{
+		Role:       "tool",
+		ToolCallID: b.ToolUseID,
+		Content:    &tokenizerTypes.Content{Raw: text},
+	})
+	if len(imageBlocks) > 0 {
+		conversation = append(conversation, tokenizerTypes.Conversation{
+			Role:    "user",
+			Content: &tokenizerTypes.Content{Structured: imageBlocks},
+		})
+	}
+	return conversation
+}
+
+// anthropicToolResultContent splits a tool_result's content into its text
+// (block texts joined with newlines) and image blocks.
+func anthropicToolResultContent(b fwkrh.AnthropicContentBlock) (string, []tokenizerTypes.ContentBlock) {
+	if b.Content.Raw != "" {
+		return b.Content.Raw, nil
+	}
+	var parts []string
+	var imageBlocks []tokenizerTypes.ContentBlock
+	for _, item := range b.Content.Structured {
+		switch item.Type {
+		case blockTypeText:
+			parts = append(parts, item.Text)
+		case blockTypeImage:
+			imageBlocks = appendImageBlock(imageBlocks, item.Source)
+		}
+	}
+	return strings.Join(parts, "\n"), imageBlocks
+}
+
+// convertAnthropicTools rewrites Anthropic tool definitions into OpenAI
+// function tools.
+func convertAnthropicTools(tools []fwkrh.AnthropicTool) []any {
+	if len(tools) == 0 {
+		return nil
+	}
+	out := make([]any, 0, len(tools))
+	for _, t := range tools {
+		var schema json.RawMessage = bytes.TrimSpace(t.InputSchema)
+		if len(schema) == 0 || bytes.Equal(schema, []byte("null")) {
+			schema = json.RawMessage(`{"type":"object"}`)
+		}
+		// Anthropic requests are forwarded from PayloadMap, whose Marshal uses
+		// encoding/json and therefore sorts every object key. Canonicalize the
+		// schema the same way before tokenization so the lookup blocks match the
+		// prompt vLLM actually receives after EPP repackage.
+		schema = canonicalizeAnthropicInputSchema(schema)
+		fn := map[string]any{
+			"name":       t.Name,
+			"parameters": schema,
+		}
+		if t.Description != "" {
+			fn["description"] = t.Description
+		}
+		if t.Strict != nil {
+			fn["strict"] = *t.Strict
+		}
+		if t.DeferLoading != nil {
+			fn["defer_loading"] = *t.DeferLoading
+		}
+		out = append(out, map[string]any{"type": "function", "function": fn})
+	}
+	return out
+}
+
+// canonicalizeRepackagedJSON applies the same decode-and-encode cycle used by
+// PayloadMap.Marshal. encoding/json sorts object keys, including nested ones.
+func canonicalizeRepackagedJSON(raw json.RawMessage) json.RawMessage {
+	var decoded any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		return raw
+	}
+	canonical, err := json.Marshal(decoded)
+	if err != nil {
+		return raw
+	}
+	return canonical
+}
+
+// canonicalizeAnthropicInputSchema also mirrors vLLM's AnthropicTool
+// validator, which supplies an object type when input_schema omits it.
+func canonicalizeAnthropicInputSchema(raw json.RawMessage) json.RawMessage {
+	var decoded any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		return raw
+	}
+	canonical, err := json.Marshal(decoded)
+	if err != nil {
+		return raw
+	}
+	schema, ok := decoded.(map[string]any)
+	if !ok {
+		return canonical
+	}
+	if _, exists := schema["type"]; exists {
+		return canonical
+	}
+	// vLLM validates the already-decoded schema and appends the default type
+	// to that Python dict. Keep the same insertion order after the existing
+	// canonical keys instead of re-sorting the added member with encoding/json.
+	if len(schema) == 0 {
+		return json.RawMessage(`{"type":"object"}`)
+	}
+	canonical = append(canonical[:len(canonical)-1], []byte(`,"type":"object"}`)...)
+	return canonical
+}
+
+// anthropicImageToURL converts an Anthropic image source to an OpenAI-shaped
+// URL. Sources carrying a URL pass it through (URL sources, and sources
+// missing a type); base64 sources become data URIs, with an image/jpeg media
+// type when absent. Sources with neither a URL nor data yield "" so the
+// caller drops the block.
+func anthropicImageToURL(src *fwkrh.AnthropicImageSource) string {
+	if src == nil {
+		return ""
+	}
+	if src.Type == "url" || src.URL != "" {
+		return src.URL
+	}
+	if src.Data == "" {
+		return ""
+	}
+	mediaType := src.MediaType
+	if mediaType == "" {
+		mediaType = defaultImageMediaType
+	}
+	return "data:" + mediaType + ";base64," + src.Data
+}
+
 // convertMMFeaturesToUpstream flattens the kv-cache map-shaped multimodal
-// metadata into a flat list sorted by placeholder offset so consumers see
-// items in prompt order. Returns nil when no content is present.
+// metadata into the upstream flat list, sorted by placeholder offset so
+// consumers see items in prompt order. Returns nil when no content is present.
 func convertMMFeaturesToUpstream(src *tokenization.MultiModalFeatures) []fwkrh.MultiModalFeature {
 	if src == nil || len(src.MMHashes) == 0 {
 		return nil

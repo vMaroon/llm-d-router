@@ -19,12 +19,12 @@ package steps
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync"
 	"testing"
 
-	reqcommon "github.com/llm-d/llm-d-router/pkg/common/request"
 	"github.com/llm-d/llm-d-router/pkg/coordinator/config"
 	"github.com/llm-d/llm-d-router/pkg/coordinator/gateway"
 	"github.com/llm-d/llm-d-router/pkg/coordinator/pipeline"
@@ -40,7 +40,7 @@ func TestGatewayPaths_EncodePrefillDecode(t *testing.T) {
 		receivedPhases = append(receivedPhases, phase)
 		mu.Unlock()
 
-		if r.URL.Path != reqcommon.PathChatCompletions {
+		if r.URL.Path != gateway.PathChatCompletions {
 			t.Errorf("unexpected path: %s", r.URL.Path)
 			http.Error(w, "unexpected path", 404)
 			return
@@ -48,12 +48,17 @@ func TestGatewayPaths_EncodePrefillDecode(t *testing.T) {
 
 		switch phase {
 		case gateway.PhaseEncode:
-			// The chat/completions sub-request carries no per-image hash (that
-			// only travels through MultimodalEntries), so key the fake response
-			// off the single entry's known hash.
+			body, _ := io.ReadAll(r.Body)
+			var parsed map[string]any
+			_ = json.Unmarshal(body, &parsed)
+			tokens, _ := parsed["tokens"].(map[string]any)
+			features, _ := tokens["features"].(map[string]any)
+			mmHashes, _ := features["mm_hashes"].(map[string]any)
+			imageHashes, _ := mmHashes[ModalityImage].([]any)
+			hash, _ := imageHashes[0].(string)
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"ec_transfer_params": map[string]any{
-					"h1": map[string]any{"peer_host": "10.0.0.1", "peer_port": 5501},
+					hash: map[string]any{"peer_host": "10.0.0.1", "peer_port": 5501},
 				},
 			})
 		case gateway.PhasePrefill:
@@ -78,7 +83,7 @@ func TestGatewayPaths_EncodePrefillDecode(t *testing.T) {
 
 	reqCtx := &pipeline.RequestContext{
 		RequestID:    "req-path-test",
-		OriginalPath: reqcommon.PathChatCompletions,
+		OriginalPath: gateway.PathChatCompletions,
 		Model:        "test-model",
 		Stream:       false,
 		TokenIDs:     []int{1, 32000, 32000, 32000, 2345},
@@ -177,14 +182,15 @@ func TestGatewayPaths_CompletionsPreservedWhenOpenAIFormatDisabled(t *testing.T)
 
 	gwClient := gateway.New(config.GatewayConfig{Address: gwServer.URL})
 
-	// No MultimodalEntries: /v1/completions is text-only, so a real completions
-	// request never carries images and never reaches the encode fan-out.
 	reqCtx := &pipeline.RequestContext{
-		RequestID:        "req-openai-false",
-		OriginalPath:     reqcommon.PathCompletions,
-		Model:            "test-model",
-		Stream:           false,
-		TokenIDs:         []int{1, 32000, 32000, 32000, 2345},
+		RequestID:    "req-openai-false",
+		OriginalPath: gateway.PathCompletions,
+		Model:        "test-model",
+		Stream:       false,
+		TokenIDs:     []int{1, 32000, 32000, 32000, 2345},
+		MultimodalEntries: []pipeline.MultimodalEntry{
+			{Index: 0, Hash: "h1", KwargsData: "dGVzdA==", Placeholder: pipeline.PlaceholderRange{Offset: 1, Length: 3}},
+		},
 		KVTransferParams: make(map[string]any),
 		Body:             map[string]any{"model": "test-model", "stream": false, "prompt": "hello"},
 	}
@@ -211,7 +217,7 @@ func TestGatewayPaths_CompletionsPreservedWhenOpenAIFormatDisabled(t *testing.T)
 	defer mu.Unlock()
 
 	for i, path := range receivedPaths {
-		if path != reqcommon.PathCompletions {
+		if path != gateway.PathCompletions {
 			t.Errorf("request %d: expected /v1/completions, got %s", i, path)
 		}
 	}
@@ -235,7 +241,7 @@ func TestGatewayPaths_DecodeWithCompletionsEndpoint(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	reqCtx := &pipeline.RequestContext{
 		RequestID:        "req-2",
-		OriginalPath:     reqcommon.PathCompletions,
+		OriginalPath:     gateway.PathCompletions,
 		Model:            "test",
 		Stream:           false,
 		TokenIDs:         []int{1, 2345, 6789},
@@ -252,7 +258,7 @@ func TestGatewayPaths_DecodeWithCompletionsEndpoint(t *testing.T) {
 		t.Fatalf("decode failed: %v", err)
 	}
 
-	if receivedPath != reqcommon.PathCompletions {
+	if receivedPath != gateway.PathCompletions {
 		t.Fatalf("expected /v1/completions, got %s", receivedPath)
 	}
 	if receivedPhase != gateway.PhaseDecode {

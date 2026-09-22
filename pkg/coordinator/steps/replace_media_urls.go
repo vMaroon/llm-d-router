@@ -37,7 +37,6 @@ import (
 
 	"github.com/llm-d/llm-d-router/pkg/coordinator/config"
 	"github.com/llm-d/llm-d-router/pkg/coordinator/gateway"
-	coordmetrics "github.com/llm-d/llm-d-router/pkg/coordinator/metrics"
 	"github.com/llm-d/llm-d-router/pkg/coordinator/pipeline"
 	"golang.org/x/sync/errgroup"
 )
@@ -267,17 +266,14 @@ func (s *ReplaceMediaURLsStep) download(ctx context.Context, rawURL string) ([]b
 	if err != nil {
 		return nil, "", err
 	}
-	call := coordmetrics.StartUpstreamCall(coordmetrics.UpstreamReplaceMediaURLs)
 	resp, err := s.client.Do(req)
-	call.Done()
 	if err != nil {
 		return nil, "", err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		respBody := readErrorBody(resp.Body)
-		return nil, "", upstreamError(ReplaceMediaURLsStepName, resp.StatusCode, respBody)
+		return nil, "", fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 
 	if resp.ContentLength > s.maxDownloadSize {

@@ -1,19 +1,3 @@
-/*
-Copyright 2025 The llm-d Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
 package proxy
 
 import (
@@ -27,7 +11,6 @@ import (
 	"golang.org/x/sync/errgroup"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	"github.com/llm-d/llm-d-router/pkg/common/observability/logging"
 	"github.com/llm-d/llm-d-router/pkg/common/routing"
 )
 
@@ -39,17 +22,17 @@ func (s *Server) dataParallelHandler(w http.ResponseWriter, r *http.Request) boo
 		s.logger.Info("The use of the x-data-parallel-host-port is deprecated. Use Istio >= 1.28.1.")
 		handler := s.dataParallelProxies[dataParallelPodHostPort]
 		if handler != nil {
-			s.logger.V(logging.DEBUG).Info("Data parallel routing", "to", dataParallelPodHostPort)
+			s.logger.V(4).Info("Data parallel routing", "to", dataParallelPodHostPort)
 			handler.ServeHTTP(w, r)
 		} else {
 			// Shouldn't happen, send to default server
-			s.logger.V(logging.DEBUG).Info("Didn't find the Data Parallel Proxy", "for", dataParallelPodHostPort)
+			s.logger.V(4).Info("Didn't find the Data Parallel Proxy", "for", dataParallelPodHostPort)
 			w.WriteHeader(http.StatusBadRequest)
 		}
 		return true
 	}
 
-	s.logger.V(logging.DEBUG).Info("skip data parallel")
+	s.logger.V(4).Info("skip data parallel")
 	return false
 }
 

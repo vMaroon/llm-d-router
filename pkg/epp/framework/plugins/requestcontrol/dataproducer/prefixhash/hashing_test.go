@@ -1,5 +1,5 @@
 /*
-Copyright 2026 The llm-d Authors.
+Copyright 2026 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -87,11 +87,11 @@ func TestGetBlockHashes(t *testing.T) {
 		expectedBlocks  int
 	}{
 		{
-			name: "TokenizedRequest",
+			name: "TokenizedPrompt",
 			request: &fwksched.InferenceRequest{
 				Body: &fwkrh.InferenceRequestBody{
-					TokenizedRequest: &fwkrh.TokenizedRequest{
-						Prompts: []fwkrh.PromptTokens{{TokenIDs: []uint32{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}}},
+					TokenizedPrompt: &fwkrh.TokenizedPrompt{
+						PerPromptTokens: [][]uint32{{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}},
 					},
 				},
 			},
@@ -99,7 +99,7 @@ func TestGetBlockHashes(t *testing.T) {
 			expectedBlocks:  3,
 		},
 		{
-			name: "MissingTokenizedRequest",
+			name: "MissingTokenizedPrompt",
 			request: &fwksched.InferenceRequest{
 				Body: &fwkrh.InferenceRequestBody{},
 			},
@@ -110,7 +110,7 @@ func TestGetBlockHashes(t *testing.T) {
 			name: "EmptyTokenIDs",
 			request: &fwksched.InferenceRequest{
 				Body: &fwkrh.InferenceRequestBody{
-					TokenizedRequest: &fwkrh.TokenizedRequest{},
+					TokenizedPrompt: &fwkrh.TokenizedPrompt{},
 				},
 			},
 			blockSizeTokens: 4,
@@ -139,9 +139,9 @@ func TestGetBlockHashes(t *testing.T) {
 func TestGetBlockHashesCacheSalt(t *testing.T) {
 	body := func(salt string) *fwkrh.InferenceRequestBody {
 		return &fwkrh.InferenceRequestBody{
-			TokenizedRequest: &fwkrh.TokenizedRequest{
-				Prompts:   []fwkrh.PromptTokens{{TokenIDs: []uint32{1, 2, 3, 4}}},
-				CacheSalt: salt,
+			TokenizedPrompt: &fwkrh.TokenizedPrompt{
+				PerPromptTokens: [][]uint32{{1, 2, 3, 4}},
+				CacheSalt:       salt,
 			},
 		}
 	}
@@ -160,28 +160,28 @@ func TestGetBlockHashesCacheSalt(t *testing.T) {
 func TestGetBlockHashes_MultiPrompt(t *testing.T) {
 	tests := []struct {
 		name                    string
-		prompts                 []fwkrh.PromptTokens
+		perPromptTokens         [][]uint32
 		blockSizeTokens         int
 		expectedPrompts         int
 		expectedBlocksPerPrompt []int
 	}{
 		{
 			name:                    "TwoPrompts",
-			prompts:                 []fwkrh.PromptTokens{{TokenIDs: []uint32{1, 2, 3, 4}}, {TokenIDs: []uint32{5, 6, 7, 8}}},
+			perPromptTokens:         [][]uint32{{1, 2, 3, 4}, {5, 6, 7, 8}},
 			blockSizeTokens:         2,
 			expectedPrompts:         2,
 			expectedBlocksPerPrompt: []int{2, 2},
 		},
 		{
 			name:                    "ThreePromptsUnevenLengths",
-			prompts:                 []fwkrh.PromptTokens{{TokenIDs: []uint32{1, 2, 3}}, {TokenIDs: []uint32{4, 5}}, {TokenIDs: []uint32{6}}},
+			perPromptTokens:         [][]uint32{{1, 2, 3}, {4, 5}, {6}},
 			blockSizeTokens:         2,
 			expectedPrompts:         3,
 			expectedBlocksPerPrompt: []int{2, 1, 1},
 		},
 		{
 			name:                    "EmptyPromptSkipped",
-			prompts:                 []fwkrh.PromptTokens{{TokenIDs: []uint32{1, 2}}, {TokenIDs: []uint32{}}, {TokenIDs: []uint32{3, 4}}},
+			perPromptTokens:         [][]uint32{{1, 2}, {}, {3, 4}},
 			blockSizeTokens:         2,
 			expectedPrompts:         2,
 			expectedBlocksPerPrompt: []int{1, 1},
@@ -193,8 +193,8 @@ func TestGetBlockHashes_MultiPrompt(t *testing.T) {
 			request := &fwksched.InferenceRequest{
 				TargetModel: "model",
 				Body: &fwkrh.InferenceRequestBody{
-					TokenizedRequest: &fwkrh.TokenizedRequest{
-						Prompts: tt.prompts,
+					TokenizedPrompt: &fwkrh.TokenizedPrompt{
+						PerPromptTokens: tt.perPromptTokens,
 					},
 				},
 			}
@@ -211,16 +211,16 @@ func TestGetBlockHashes_MultiPromptHashIndependence(t *testing.T) {
 	multiPrompt := &fwksched.InferenceRequest{
 		TargetModel: "model",
 		Body: &fwkrh.InferenceRequestBody{
-			TokenizedRequest: &fwkrh.TokenizedRequest{
-				Prompts: []fwkrh.PromptTokens{{TokenIDs: []uint32{1, 2}}, {TokenIDs: []uint32{3, 4}}},
+			TokenizedPrompt: &fwkrh.TokenizedPrompt{
+				PerPromptTokens: [][]uint32{{1, 2}, {3, 4}},
 			},
 		},
 	}
 	singlePrompt := &fwksched.InferenceRequest{
 		TargetModel: "model",
 		Body: &fwkrh.InferenceRequestBody{
-			TokenizedRequest: &fwkrh.TokenizedRequest{
-				Prompts: []fwkrh.PromptTokens{{TokenIDs: []uint32{1, 2, 3, 4}}},
+			TokenizedPrompt: &fwkrh.TokenizedPrompt{
+				PerPromptTokens: [][]uint32{{1, 2, 3, 4}},
 			},
 		},
 	}

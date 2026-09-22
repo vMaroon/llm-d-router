@@ -53,14 +53,19 @@ llm-d.ai/igw-mode: llm-d-router-gateway
 Return the monitoring provider name.
 
 If router.monitoring.provider.name is unset/empty, default to
-prometheusoperator.
+prometheusoperator. For backwards compatibility, provider.name=gke still maps
+to gmp when no monitoring provider is explicitly set.
 */}}
 {{- define "llm-d-router.monitoring.provider.name" -}}
 {{- $monitoring := .Values.router.monitoring | default dict -}}
 {{- $mp := index $monitoring "provider" | default dict -}}
 {{- $mpName := index $mp "name" | default "" -}}
+{{- $gatewayProvider := .Values.provider | default dict -}}
+{{- $gatewayProviderName := index $gatewayProvider "name" | default "" -}}
 {{- if and (kindIs "string" $mpName) (ne (trim $mpName) "") -}}
 {{- $mpName -}}
+{{- else if eq (lower $gatewayProviderName) "gke" -}}
+gmp
 {{- else -}}
 prometheusoperator
 {{- end -}}
@@ -69,17 +74,24 @@ prometheusoperator
 {{/*
 Return the monitoring provider config object.
 
-When router.monitoring.provider.name is unset/empty, use the
-prometheusoperator defaults.
+When router.monitoring.provider.name is unset/empty, use defaults.
+For backwards compatibility, provider.gke.autopilot is still honored when
+provider.name=gke and no monitoring provider is explicitly set.
 */}}
 {{- define "llm-d-router.monitoring.provider" -}}
 {{- $monitoring := .Values.router.monitoring | default dict -}}
 {{- $mp := index $monitoring "provider" | default dict -}}
 {{- $mpName := include "llm-d-router.monitoring.provider.name" . -}}
+{{- $gatewayProvider := .Values.provider | default dict -}}
+{{- $gatewayProviderName := index $gatewayProvider "name" | default "" -}}
 {{- $resolved := dict "name" $mpName -}}
 {{- if eq (lower $mpName) "gmp" -}}
   {{- $gmp := index $mp "gmp" | default dict -}}
-  {{- $_ := set $resolved "gmp" (deepCopy $gmp) -}}
+  {{- $legacyGke := dict -}}
+  {{- if and (eq (lower $gatewayProviderName) "gke") (index $gatewayProvider "gke") -}}
+    {{- $legacyGke = index $gatewayProvider "gke" -}}
+  {{- end -}}
+  {{- $_ := set $resolved "gmp" (mergeOverwrite (deepCopy $legacyGke) (deepCopy $gmp)) -}}
 {{- else -}}
   {{- $_ := set $resolved "prometheusoperator" (index $mp "prometheusoperator" | default dict) -}}
 {{- end -}}
@@ -454,43 +466,6 @@ EPP generic validations
     {{- fail ".Values.provider.gke.preferredBackends.defaultReplicas must be at least 1 when preferredBackends.enabled is true" }}
   {{- end }}
 {{- end }}
-{{- end }}
-
-{{/*
-Helper to check if priorityRouting is enabled across chart contexts.
-*/}}
-{{- define "llm-d-router.priorityRouting.enabled" -}}
-{{- $router := .Values.router | default dict -}}
-{{- $proxy := index $router "proxy" | default dict -}}
-{{- if empty $proxy }}{{ $proxy = .Values.proxy | default dict }}{{ end -}}
-{{- $pr := index $proxy "priorityRouting" | default dict -}}
-{{- $enabled := index $pr "enabled" -}}
-{{- if and (not (kindIs "invalid" $enabled)) (not (kindIs "bool" $enabled)) -}}
-{{- fail (printf "priorityRouting.enabled must be a boolean, got %q" (toString $enabled)) -}}
-{{- end -}}
-{{- if and (kindIs "bool" $enabled) $enabled }}true{{ end -}}
-{{- end -}}
-
-{{- define "llm-d-router.priorityRouting.primaryReplicas" -}}
-{{- $router := .Values.router | default dict -}}
-{{- $proxy := index $router "proxy" | default dict -}}
-{{- if empty $proxy }}{{ $proxy = .Values.proxy | default dict }}{{ end -}}
-{{- $pr := index $proxy "priorityRouting" | default dict -}}
-{{- index $pr "primaryReplicas" | default 1 | int -}}
-{{- end -}}
-
-{{- define "llm-d-router.priorityRouting.standbyReplicas" -}}
-{{- $router := .Values.router | default dict -}}
-{{- $proxy := index $router "proxy" | default dict -}}
-{{- if empty $proxy }}{{ $proxy = .Values.proxy | default dict }}{{ end -}}
-{{- $pr := index $proxy "priorityRouting" | default dict -}}
-{{- index $pr "standbyReplicas" | default 1 | int -}}
-{{- end -}}
-
-{{- define "llm-d-router.priorityRouting.totalReplicas" -}}
-{{- $primary := include "llm-d-router.priorityRouting.primaryReplicas" . | int -}}
-{{- $standby := include "llm-d-router.priorityRouting.standbyReplicas" . | int -}}
-{{- add $primary $standby -}}
 {{- end -}}
 
 {{- define "llm-d-router.validations.epp" -}}
@@ -499,35 +474,15 @@ Helper to check if priorityRouting is enabled across chart contexts.
 {{- include "llm-d-router.validations.epp.inferenceObjectives" . }}
 {{- include "llm-d-router.validations.epp.tokenizer" . }}
 {{- include "llm-d-router.validations.epp.preferredBackends" . }}
-{{- $isPriorityRouting := eq (include "llm-d-router.priorityRouting.enabled" .) "true" -}}
-{{- if and $isPriorityRouting (ne (include "llm-d-router.proxyMode" .) "service") -}}
-{{- fail "priorityRouting is only supported when proxy mode is set to 'service' (router.proxy.mode=service)" -}}
-{{- end -}}
-{{- $eppFlags := .Values.router.epp.flags | default dict -}}
-{{- if and $isPriorityRouting (hasKey $eppFlags "health-checking") -}}
-{{- $healthChecking := index $eppFlags "health-checking" -}}
-{{- if not (kindIs "bool" $healthChecking) -}}
-{{- fail (printf ".Values.router.epp.flags.health-checking must be a boolean, got %q" (toString $healthChecking)) -}}
-{{- end -}}
-{{- if not $healthChecking -}}
-{{- fail "priorityRouting requires EPP's gRPC health service on port 9002 (router.epp.flags.health-checking cannot be false when priorityRouting.enabled=true)" -}}
-{{- end -}}
-{{- end -}}
 {{- end -}}
 
 {{/*
-Tokenizer validations: require modelName and valid flavor for the render sidecar.
+Tokenizer validations: require modelName for the render sidecar's command args.
 */}}
 {{- define "llm-d-router.validations.epp.tokenizer" -}}
 {{- $tokenizer := .Values.router.tokenizer | default dict }}
-{{- if (dig "enabled" false $tokenizer) }}
-{{- if not (dig "modelName" "" $tokenizer) }}
+{{- if and (dig "enabled" false $tokenizer) (not (dig "modelName" "" $tokenizer)) }}
 {{- fail ".Values.router.tokenizer.modelName is required when the tokenizer is enabled." }}
-{{- end }}
-{{- $flavor := dig "flavor" "python" $tokenizer | lower }}
-{{- if not (or (eq $flavor "python") (eq $flavor "rust")) }}
-{{- fail (printf ".Values.router.tokenizer.flavor must be one of [python, rust], got %q" (dig "flavor" "" $tokenizer)) }}
-{{- end }}
 {{- end }}
 {{- end -}}
 
@@ -559,21 +514,5 @@ Deprecation validations
 {{- end }}
 {{- if .Values.inferenceObjectives }}
 {{- fail "Top-level 'inferenceObjectives' is deprecated. Please migrate your values to 'router.inferenceObjectives'." }}
-{{- end }}
-{{- end -}}
-
-{{/*
-Annotations for the EPP pod template.
-
-The EPP parses its plugin configuration once at startup and never re-reads the
-mounted file, so a helm upgrade that touches only a ConfigMap has to change the
-pod template or the running pod keeps its old configuration. Hash the whole
-config partial rather than one ConfigMap: it renders the plugins, proxy and
-latency-predictor ConfigMaps, and all of them are mounted into this pod.
-*/}}
-{{- define "llm-d-epp.podAnnotations" -}}
-checksum/config: {{ include "llm-d-epp.config" . | sha256sum }}
-{{- with .Values.router.epp.podAnnotations }}
-{{- toYaml . | nindent 0 }}
 {{- end }}
 {{- end -}}

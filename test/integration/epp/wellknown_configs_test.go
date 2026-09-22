@@ -1,5 +1,5 @@
 /*
-Copyright 2026 The llm-d Authors.
+Copyright 2026 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -107,6 +107,7 @@ schedulingProfiles:
 apiVersion: llm-d.ai/v1alpha1
 kind: EndpointPickerConfig
 plugins:
+- type: disagg-headers-handler
 - type: disagg-profile-handler
   parameters:
     deciders:
@@ -140,10 +141,11 @@ schedulingProfiles:
   - pluginRef: max-score-picker
 `,
 		expectedPlugins: []configapi.PluginSpec{
+			{Name: "disagg-headers-handler", Type: "disagg-headers-handler"},
 			{Name: "always-disagg-pd-decider", Type: "always-disagg-pd-decider"},
 			{Name: "disagg-profile-handler", Type: "disagg-profile-handler"},
-			{Name: "prefill-filter", Type: "prefill-filter"},
-			{Name: "decode-filter", Type: "decode-filter"},
+			{Name: "prefill-filter", Type: "by-label"},
+			{Name: "decode-filter", Type: "by-label"},
 			{Name: "prefix-cache-scorer", Type: "prefix-cache-scorer"},
 			// The producer is auto created because the prefix-cache-scorer consumes its data.
 			{Name: "approx-prefix-cache-producer", Type: "approx-prefix-cache-producer"},
@@ -160,6 +162,7 @@ schedulingProfiles:
 apiVersion: llm-d.ai/v1alpha1
 kind: EndpointPickerConfig
 plugins:
+- type: disagg-headers-handler
 - type: disagg-profile-handler
   parameters:
     deciders:
@@ -192,10 +195,11 @@ schedulingProfiles:
   - pluginRef: max-score-picker
 `,
 		expectedPlugins: []configapi.PluginSpec{
+			{Name: "disagg-headers-handler", Type: "disagg-headers-handler"},
 			{Name: "always-disagg-pd-decider", Type: "always-disagg-pd-decider"},
 			{Name: "disagg-profile-handler", Type: "disagg-profile-handler"},
-			{Name: "prefill-filter", Type: "prefill-filter"},
-			{Name: "decode-filter", Type: "decode-filter"},
+			{Name: "prefill-filter", Type: "by-label"},
+			{Name: "decode-filter", Type: "by-label"},
 			{Name: "prefix-cache-scorer", Type: "prefix-cache-scorer"},
 			// The producer is auto created because the prefix-cache-scorer consumes its data.
 			{Name: "approx-prefix-cache-producer", Type: "approx-prefix-cache-producer"},
@@ -214,15 +218,13 @@ kind: EndpointPickerConfig
 plugins:
 - type: token-producer
 - type: prefix-based-pd-decider
+- type: prefill-header-handler
 - type: prefill-filter
 - type: decode-filter
 - type: prefix-cache-scorer
 - type: active-request-scorer
 - type: queue-scorer
-- type: disagg-profile-handler
-  parameters:
-    deciders:
-      prefill: prefix-based-pd-decider
+- type: pd-profile-handler
 schedulingProfiles:
 - name: prefill
   plugins:
@@ -243,14 +245,15 @@ schedulingProfiles:
 `,
 		expectedPlugins: []configapi.PluginSpec{
 			{Name: "token-producer", Type: "token-producer"},
-			{Name: "prefill-filter", Type: "prefill-filter"},
-			{Name: "decode-filter", Type: "decode-filter"},
+			{Name: "prefill-header-handler", Type: "disagg-headers-handler"},
+			{Name: "prefill-filter", Type: "by-label"},
+			{Name: "decode-filter", Type: "by-label"},
 			{Name: "prefix-cache-scorer", Type: "prefix-cache-scorer"},
 			// The producer is auto created because the prefix-cache-scorer consumes its data.
 			{Name: "approx-prefix-cache-producer", Type: "approx-prefix-cache-producer"},
 			{Name: "active-request-scorer", Type: "active-request-scorer"},
 			{Name: "queue-scorer", Type: "queue-scorer"},
-			{Name: "disagg-profile-handler", Type: "disagg-profile-handler"},
+			{Name: "pd-profile-handler", Type: "pd-profile-handler"},
 		},
 	},
 	"flow-control": {

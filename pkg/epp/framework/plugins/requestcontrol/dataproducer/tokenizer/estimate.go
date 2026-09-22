@@ -25,7 +25,6 @@ import (
 	"strings"
 
 	"github.com/cespare/xxhash/v2"
-	tokenizerTypes "github.com/llm-d/llm-d-router/pkg/kvcache/tokenization/types"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	logutil "github.com/llm-d/llm-d-router/pkg/common/observability/logging"
@@ -36,80 +35,6 @@ import (
 // bytesPerToken matches the scorer's averageCharactersPerToken, so a block of N
 // pseudo-tokens covers the same input bytes as an N-token raw-byte block.
 const bytesPerToken = 4
-
-// Content-block types read by the estimate backend.
-const (
-	blockTypeText       = "text"
-	blockTypeImage      = "image"
-	blockTypeImageURL   = "image_url"
-	blockTypeThinking   = "thinking"
-	blockTypeToolUse    = "tool_use"
-	blockTypeToolResult = "tool_result"
-)
-
-const (
-	// Per-request billing hashes must not defeat prefix caching.
-	anthropicBillingHeaderPrefix = "x-anthropic-billing-header"
-	// The base64 image fallback matches vLLM's Anthropic conversion.
-	defaultImageMediaType = "image/jpeg"
-)
-
-func anthropicSystemText(ac fwkrh.AnthropicContent) string {
-	if ac.Raw != "" {
-		return ac.Raw
-	}
-	var sb strings.Builder
-	for _, block := range ac.Structured {
-		if block.Type == blockTypeText && block.Text != "" && !strings.HasPrefix(block.Text, anthropicBillingHeaderPrefix) {
-			sb.WriteString(block.Text)
-		}
-	}
-	return sb.String()
-}
-
-func appendImageBlock(blocks []tokenizerTypes.ContentBlock, src *fwkrh.AnthropicImageSource) []tokenizerTypes.ContentBlock {
-	if url := anthropicImageToURL(src); url != "" {
-		blocks = append(blocks, tokenizerTypes.ContentBlock{
-			Type:     blockTypeImageURL,
-			ImageURL: tokenizerTypes.ImageBlock{URL: url},
-		})
-	}
-	return blocks
-}
-
-func anthropicToolResultContent(b fwkrh.AnthropicContentBlock) (string, []tokenizerTypes.ContentBlock) {
-	if b.Content.Raw != "" {
-		return b.Content.Raw, nil
-	}
-	var parts []string
-	var imageBlocks []tokenizerTypes.ContentBlock
-	for _, item := range b.Content.Structured {
-		switch item.Type {
-		case blockTypeText:
-			parts = append(parts, item.Text)
-		case blockTypeImage:
-			imageBlocks = appendImageBlock(imageBlocks, item.Source)
-		}
-	}
-	return strings.Join(parts, "\n"), imageBlocks
-}
-
-func anthropicImageToURL(src *fwkrh.AnthropicImageSource) string {
-	if src == nil {
-		return ""
-	}
-	if src.Type == "url" || src.URL != "" {
-		return src.URL
-	}
-	if src.Data == "" {
-		return ""
-	}
-	mediaType := src.MediaType
-	if mediaType == "" {
-		mediaType = defaultImageMediaType
-	}
-	return "data:" + mediaType + ";base64," + src.Data
-}
 
 // estimateBackend packs request bytes into pseudo-tokens with no real tokenizer.
 // The IDs suit content-locality hashing only; they never match engine KV blocks,
@@ -181,30 +106,27 @@ func parseResolution(s string) (width, height int) {
 	return w, h
 }
 
-func (b estimateBackend) produce(ctx context.Context, body *fwkrh.InferenceRequestBody) (*fwkrh.TokenizedRequest, error) {
+func (b estimateBackend) produce(ctx context.Context, body *fwkrh.InferenceRequestBody) (*fwkrh.TokenizedPrompt, error) {
 	// Pre-tokenized inputs are already real tokens; pass them through unchanged
 	// rather than byte-estimating. Token-ID inputs are valid for generate,
 	// /v1/completions, and /v1/embeddings.
 	switch {
 	case body.Generate != nil:
-		return &fwkrh.TokenizedRequest{Prompts: []fwkrh.PromptTokens{{
-			TokenIDs:           body.Generate.TokenIDs,
+		return &fwkrh.TokenizedPrompt{
+			PerPromptTokens:    [][]uint32{body.Generate.TokenIDs},
 			MultiModalFeatures: convertMMFeaturesToUpstream(body.Generate.Features),
-		}}}, nil
+		}, nil
 	case body.Completions != nil && len(body.Completions.Prompt.TokenIDs) > 0:
-		return fwkrh.NewTokenizedRequest(body.Completions.Prompt.TokenIDs), nil
+		return &fwkrh.TokenizedPrompt{PerPromptTokens: [][]uint32{body.Completions.Prompt.TokenIDs}}, nil
 	case body.Embeddings != nil && len(body.Embeddings.Input.TokenIDs) > 0:
-		return fwkrh.NewTokenizedRequest(body.Embeddings.Input.TokenIDs), nil
+		return &fwkrh.TokenizedPrompt{PerPromptTokens: [][]uint32{body.Embeddings.Input.TokenIDs}}, nil
 	}
 
 	// Chat and Anthropic messages fold multimodal placeholders into the stream
 	// and report them as features.
 	if body.ChatCompletions != nil {
 		raw, features := b.chatCompletionsBytes(body.ChatCompletions, mmMetadataFromContext(ctx))
-		return &fwkrh.TokenizedRequest{Prompts: []fwkrh.PromptTokens{{
-			TokenIDs:           packBytes(raw),
-			MultiModalFeatures: features,
-		}}}, nil
+		return &fwkrh.TokenizedPrompt{PerPromptTokens: [][]uint32{packBytes(raw)}, MultiModalFeatures: features}, nil
 	}
 	if body.Messages != nil {
 		raw, features := b.messagesBytes(body.Messages)
@@ -216,10 +138,7 @@ func (b estimateBackend) produce(ctx context.Context, body *fwkrh.InferenceReque
 			"mmFeatureCount", len(features),
 			"mmFeatures", features,
 		)
-		return &fwkrh.TokenizedRequest{Prompts: []fwkrh.PromptTokens{{
-			TokenIDs:           tokens,
-			MultiModalFeatures: features,
-		}}}, nil
+		return &fwkrh.TokenizedPrompt{PerPromptTokens: [][]uint32{tokens}, MultiModalFeatures: features}, nil
 	}
 
 	if body.Completions != nil && len(body.Completions.Prompt.Strings) > 1 {
@@ -230,16 +149,16 @@ func (b estimateBackend) produce(ctx context.Context, body *fwkrh.InferenceReque
 	if err != nil {
 		return nil, err
 	}
-	return &fwkrh.TokenizedRequest{Prompts: []fwkrh.PromptTokens{{TokenIDs: packBytes(raw)}}}, nil
+	return &fwkrh.TokenizedPrompt{PerPromptTokens: [][]uint32{packBytes(raw)}}, nil
 }
 
-func estimateMultiStringCompletions(req *fwkrh.CompletionsRequest) (*fwkrh.TokenizedRequest, error) {
-	prompts := make([]fwkrh.PromptTokens, 0, len(req.Prompt.Strings))
+func estimateMultiStringCompletions(req *fwkrh.CompletionsRequest) (*fwkrh.TokenizedPrompt, error) {
+	allTokenIDs := make([][]uint32, 0, len(req.Prompt.Strings))
 	for _, s := range req.Prompt.Strings {
 		ids := packBytes([]byte(s))
-		prompts = append(prompts, fwkrh.PromptTokens{TokenIDs: ids})
+		allTokenIDs = append(allTokenIDs, ids)
 	}
-	return &fwkrh.TokenizedRequest{Prompts: prompts}, nil
+	return &fwkrh.TokenizedPrompt{PerPromptTokens: allTokenIDs}, nil
 }
 
 // estimateBytes serializes the user input of a non-chat request body to a byte

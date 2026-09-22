@@ -24,7 +24,6 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	reqcommon "github.com/llm-d/llm-d-router/pkg/common/request"
 	"github.com/llm-d/llm-d-router/pkg/coordinator/config"
 	"github.com/llm-d/llm-d-router/pkg/coordinator/connectors/kv"
 	"github.com/llm-d/llm-d-router/pkg/coordinator/gateway"
@@ -183,7 +182,7 @@ func TestDecodeStep_ConnectorShapesDecodeBody(t *testing.T) {
 			recorder := httptest.NewRecorder()
 			reqCtx := &pipeline.RequestContext{
 				RequestID:        "req",
-				OriginalPath:     reqcommon.PathChatCompletions,
+				OriginalPath:     gateway.PathChatCompletions,
 				Model:            "m",
 				KVTransferParams: tc.prefillResponse,
 				Body:             map[string]any{"model": "m"},

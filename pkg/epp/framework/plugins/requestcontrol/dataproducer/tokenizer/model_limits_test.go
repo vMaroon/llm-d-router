@@ -1,25 +1,8 @@
-/*
-Copyright 2026 The llm-d Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
 package tokenizer
 
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -27,12 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
-
-	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
-	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
+	"github.com/stretchr/testify/require"
 )
 
 func TestDiscoveredModelLimits(t *testing.T) {
@@ -42,10 +21,10 @@ func TestDiscoveredModelLimits(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		require.Equal(t, "/v1/models", r.URL.Path)
 		if bad.Load() {
-			http.Error(w, "unavailable", http.StatusServiceUnavailable)
+			http.Error(w, "unavailable", 503)
 			return
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"data": []any{map[string]any{"id": "glm", "max_model_len": limit.Load()}}})
+		json.NewEncoder(w).Encode(map[string]any{"data": []any{map[string]any{"id": "glm", "max_model_len": limit.Load()}}})
 	}))
 	defer server.Close()
 	host, port, _ := net.SplitHostPort(server.Listener.Addr().String())
@@ -69,7 +48,15 @@ func TestDiscoveredModelLimits(t *testing.T) {
 	bad.Store(true)
 	p.refreshModelLimits(context.Background(), server.Client(), "glm")
 	_, err = p.Pick()
-	require.Error(t, err, "failed metadata refresh must not retain an unverified target")
+	require.NoError(t, err, "one failed refresh must retain still-fresh verified capacity")
+	p.mu.Lock()
+	for _, c := range p.capabilities {
+		c.refreshed = time.Now().Add(-modelLimitFreshness - time.Second)
+	}
+	p.mu.Unlock()
+	p.refreshModelLimits(context.Background(), server.Client(), "glm")
+	_, err = p.Pick()
+	require.Error(t, err, "failed probes must not renew stale capacity")
 	p.Delete(ep.GetMetadata())
 	require.Empty(t, p.capabilities)
 }
@@ -90,58 +77,33 @@ func TestModelLimitLabelValidation(t *testing.T) {
 }
 
 func TestRenderOnlyBudgetPreservesPayload(t *testing.T) {
-	for _, completions := range []bool{false, true} {
-		for _, enabled := range []bool{false, true} {
-			t.Run(fmt.Sprintf("completions=%t/prefillOnly=%t", completions, enabled), func(t *testing.T) {
-				payload := fwkrh.PayloadMap{"max_tokens": 32000, "max_completion_tokens": 32000, "min_tokens": 5}
-				path := chatRenderPath
-				if completions {
-					payload["prompt"] = "unchanged"
-					path = completionsRenderPath
-				} else {
-					payload["messages"] = []any{map[string]any{"role": "user", "content": "unchanged"}}
-				}
-				before, err := json.Marshal(payload)
-				require.NoError(t, err)
-				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					var body map[string]any
-					if !assert.NoError(t, json.NewDecoder(r.Body).Decode(&body)) {
-						return
-					}
-					assert.Equal(t, path, r.URL.Path)
-					wantMax, wantMin := float64(32000), float64(5)
-					if enabled {
-						wantMax, wantMin = 1, 0
-					}
-					assert.Equal(t, wantMax, body["max_tokens"])
-					assert.Equal(t, wantMax, body["max_completion_tokens"])
-					assert.Equal(t, wantMin, body["min_tokens"])
-					if completions {
-						assert.Equal(t, "unchanged", body["prompt"])
-					} else {
-						assert.Equal(t, payload["messages"], body["messages"])
-					}
-					w.Header().Set("Content-Type", "application/json")
-					if completions {
-						_, _ = w.Write([]byte(`[{"token_ids":[1,2,3]}]`))
-					} else {
-						_, _ = w.Write([]byte(`{"token_ids":[1,2,3]}`))
-					}
-				}))
-				defer server.Close()
-				r, err := newVLLMHTTPRenderer(&vllmConfig{URL: server.URL, PrefillOnly: enabled})
-				require.NoError(t, err)
-				if completions {
-					_, _, err = r.Render(context.Background(), payload)
-				} else {
-					_, _, err = r.RenderChat(context.Background(), payload)
-				}
-				require.NoError(t, err)
-				after, err := json.Marshal(payload)
-				require.NoError(t, err)
-				require.Equal(t, before, after)
-			})
+	for _, native := range []bool{false, true} {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var body map[string]any
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+			require.Equal(t, float64(1), body["max_tokens"])
+			require.Equal(t, float64(1), body["max_completion_tokens"])
+			require.Equal(t, float64(0), body["min_tokens"])
+			require.Equal(t, []any{map[string]any{"role": "user", "content": "unchanged"}}, body["messages"])
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"token_ids":[1,2,3]}`))
+		}))
+		mode := "legacy"
+		if native {
+			mode = "native"
 		}
+		r, err := newVLLMHTTPRenderer(&vllmConfig{URL: server.URL, MessagesRenderMode: mode, PrefillOnly: true}, "glm")
+		require.NoError(t, err)
+		payload := fwkrh.PayloadMap{"max_tokens": 32000, "max_completion_tokens": 32000, "min_tokens": 5, "messages": []any{map[string]any{"role": "user", "content": "unchanged"}}}
+		if native {
+			_, _, err = r.RenderMessages(context.Background(), payload)
+		} else {
+			_, _, err = r.RenderChat(context.Background(), payload)
+		}
+		require.NoError(t, err)
+		require.Equal(t, 32000, payload["max_tokens"])
+		require.Equal(t, 5, payload["min_tokens"])
+		server.Close()
 	}
 }
 
@@ -158,96 +120,15 @@ func TestModelLimitProbeDeadline(t *testing.T) {
 	require.Error(t, err)
 }
 
-func TestRenderOnlyBudgetPreservesTruncation(t *testing.T) {
-	for _, path := range []string{chatRenderPath, completionsRenderPath} {
-		for _, truncate := range []any{float64(-1), json.Number("-1"), 100} {
-			t.Run(fmt.Sprintf("%s/truncate=%v", path, truncate), func(t *testing.T) {
-				payload := fwkrh.PayloadMap{"max_tokens": 20, "max_completion_tokens": 20, "min_tokens": 5, "truncate_prompt_tokens": truncate}
-				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					var body map[string]any
-					if !assert.NoError(t, json.NewDecoder(r.Body).Decode(&body)) {
-						return
-					}
-					assert.Equal(t, float64(20), body["max_tokens"])
-					assert.Equal(t, float64(20), body["max_completion_tokens"])
-					assert.Equal(t, float64(5), body["min_tokens"])
-					_, _ = w.Write([]byte(`{}`))
-				}))
-				defer server.Close()
-				renderer, err := newVLLMHTTPRenderer(&vllmConfig{URL: server.URL, PrefillOnly: true})
-				require.NoError(t, err)
-				var out map[string]any
-				require.NoError(t, renderer.postJSON(t.Context(), path, payload, time.Second, &out))
-			})
-		}
-	}
-}
-
-func TestRenderOnlyBudgetKeepsRawEnvelopeContent(t *testing.T) {
-	const tools = `[{"type":"function","function":{"name":"lookup","parameters":{"z":{"type":"string"},"a":{"type":"integer"}}}}]`
-	for _, tc := range []struct {
-		name     string
-		payload  string
-		wantMax  string
-		wantMin  string
-		wantComp string
-	}{
-		{"caps budget", `{"model":"adapter","messages":[{"role":"user","content":"hi"}],"tools":` + tools + `,"max_tokens":32000,"max_completion_tokens":32000,"min_tokens":5}`, "1", "0", "1"},
-		{"null truncation caps budget", `{"model":"adapter","tools":` + tools + `,"max_tokens":32000,"truncate_prompt_tokens":null}`, "1", "", ""},
-		{"truncation keeps budget", `{"model":"adapter","tools":` + tools + `,"max_tokens":32000,"min_tokens":5,"truncate_prompt_tokens":-1}`, "32000", "5", ""},
-		{"adds budget when absent", `{"model":"adapter","tools":` + tools + `}`, "1", "", ""},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			out, err := renderOnlyBudget([]byte(tc.payload))
-			require.NoError(t, err)
-			var envelope map[string]json.RawMessage
-			require.NoError(t, json.Unmarshal(out, &envelope))
-			assert.Equal(t, tc.wantMax, string(envelope["max_tokens"]))
-			assert.Equal(t, tc.wantMin, string(envelope["min_tokens"]))
-			assert.Equal(t, tc.wantComp, string(envelope["max_completion_tokens"]))
-			assert.Equal(t, tools, string(envelope["tools"]), "nested key order must survive")
-			assert.Equal(t, `"adapter"`, string(envelope["model"]))
-		})
-	}
-	_, err := renderOnlyBudget([]byte(`[1,2]`))
-	require.Error(t, err)
-}
-
-func TestRenderOnlyBudgetAppliesToRawPayload(t *testing.T) {
-	var seen map[string]json.RawMessage
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal(t, chatRenderPath, r.URL.Path)
-		assert.NoError(t, json.NewDecoder(r.Body).Decode(&seen))
-		_, _ = w.Write([]byte(`{"token_ids":[1,2,3]}`))
-	}))
+func TestRenderRejectsEmptyTokenIDs(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(`{"token_ids":[]}`)) }))
 	defer server.Close()
-	renderer, err := newVLLMHTTPRenderer(&vllmConfig{URL: server.URL, PrefillOnly: true})
+	renderer, err := newVLLMHTTPRenderer(&vllmConfig{URL: server.URL, MessagesRenderMode: "native"}, "glm")
 	require.NoError(t, err)
-	raw := fwkrh.RawPayload(`{"model":"adapter","messages":[{"role":"user","content":"hi"}],"max_tokens":32000}`)
-	tokens, _, err := renderer.RenderChat(context.Background(), raw)
-	require.NoError(t, err)
-	assert.Equal(t, []uint32{1, 2, 3}, tokens)
-	assert.Equal(t, "1", string(seen["max_tokens"]))
-	assert.Equal(t, `[{"role":"user","content":"hi"}]`, string(seen["messages"]))
-}
-
-func TestModelLimitEndpointReplacement(t *testing.T) {
-	p, err := newDiscoveredEndpointPicker(&endpointDiscoveryConfig{DiscoverModelLimits: true})
-	require.NoError(t, err)
-	h := newEndpointDiscoveryHandler(plugin.TypedName{Type: PluginType, Name: "test"}, p)
-	old := discoveredEndpoint("a", "127.0.0.1", "8000")
-	replacement := discoveredEndpoint("a", "127.0.0.1", "8000")
-	require.NoError(t, h.Extract(t.Context(), fwkdl.EndpointEvent{Type: fwkdl.EventAddOrUpdate, Endpoint: old}))
-	c := p.capabilities[old.GetMetadata().ID.String()]
-	c.observed, c.refreshed = 300000, time.Now()
-	require.NoError(t, h.Extract(t.Context(), fwkdl.EndpointEvent{Type: fwkdl.EventAddOrUpdate, Endpoint: old}))
-	_, err = p.Pick()
-	require.NoError(t, err, "same-object updates must preserve observations")
-	require.NoError(t, h.Extract(t.Context(), fwkdl.EndpointEvent{Type: fwkdl.EventAddOrUpdate, Endpoint: replacement}))
-	require.NoError(t, h.Extract(t.Context(), fwkdl.EndpointEvent{Type: fwkdl.EventDelete, Endpoint: old}))
-	_, err = p.Pick()
-	require.Error(t, err, "replacement must be probed before selection")
-	require.NotSame(t, c, p.capabilities[replacement.GetMetadata().ID.String()], "in-flight probes must lose their generation")
+	_, _, err = renderer.RenderMessages(context.Background(), fwkrh.PayloadMap{"messages": []any{}})
+	require.Error(t, err)
+	_, _, err = renderer.RenderChat(context.Background(), fwkrh.PayloadMap{"messages": []any{}})
+	require.Error(t, err)
 }
 
 func TestModelLimitStaleProbeCannotResurrectDeletedEndpoint(t *testing.T) {
@@ -255,7 +136,7 @@ func TestModelLimitStaleProbeCannotResurrectDeletedEndpoint(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		close(started)
 		<-release
-		_, _ = w.Write([]byte(`{"data":[{"id":"glm","max_model_len":300000}]}`))
+		w.Write([]byte(`{"data":[{"id":"glm","max_model_len":300000}]}`))
 	}))
 	defer server.Close()
 	host, port, _ := net.SplitHostPort(server.Listener.Addr().String())
@@ -275,37 +156,9 @@ func TestModelLimitStaleProbeCannotResurrectDeletedEndpoint(t *testing.T) {
 
 func TestReadModelLimitRejectsWrongModelAndInvalidMetadata(t *testing.T) {
 	for _, body := range []string{`{"data":[{"id":"other","max_model_len":300000}]}`, `{"data":[{"id":"glm","max_model_len":0}]}`, `{"data":[{"id":"glm","max_model_len":"300000"}]}`, "invalid"} {
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(body)) }))
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(body)) }))
 		_, err := readModelLimit(context.Background(), server.Client(), server.URL, "glm")
 		require.Error(t, err)
 		server.Close()
-	}
-}
-
-func TestModelLimitEligibility(t *testing.T) {
-	now := time.Now()
-	for _, tc := range []struct {
-		name       string
-		config     endpointDiscoveryConfig
-		capability renderCapability
-		want       bool
-	}{
-		{"defaults", endpointDiscoveryConfig{}, renderCapability{}, true},
-		{"unknown", endpointDiscoveryConfig{DiscoverModelLimits: true}, renderCapability{}, false},
-		{"fresh", endpointDiscoveryConfig{DiscoverModelLimits: true, MinModelLen: 100}, renderCapability{observed: 100, refreshed: now}, true},
-		{"stale", endpointDiscoveryConfig{DiscoverModelLimits: true}, renderCapability{observed: 100, refreshed: now.Add(-modelLimitFreshness - time.Second)}, false},
-		{"label bounds observed", endpointDiscoveryConfig{DiscoverModelLimits: true, MinModelLen: 100}, renderCapability{declared: 99, observed: 200, refreshed: now}, false},
-		{"observed bounds label", endpointDiscoveryConfig{DiscoverModelLimits: true, MinModelLen: 100}, renderCapability{declared: 200, observed: 99, refreshed: now}, false},
-		{"label only", endpointDiscoveryConfig{MinModelLen: 100, ContextLimitLabel: "limit"}, renderCapability{declared: 100}, true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			p, err := newDiscoveredEndpointPicker(&tc.config)
-			require.NoError(t, err)
-			require.Equal(t, tc.want, p.eligible(&tc.capability, now))
-		})
-	}
-	for _, cfg := range []endpointDiscoveryConfig{{MinModelLen: -1}, {MinModelLen: 100}} {
-		_, err := newDiscoveredEndpointPicker(&cfg)
-		require.Error(t, err)
 	}
 }

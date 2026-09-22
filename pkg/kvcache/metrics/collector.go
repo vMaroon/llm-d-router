@@ -116,17 +116,17 @@ var (
 	// LookupRequests counts how many Lookup() calls have been made.
 	LookupRequests = newDualCounter("index", "lookup_requests_total",
 		"kv_cache_index_lookup_requests_total", "Total number of lookup calls")
-	// MaxPodHitCount counts, per prefix match, the longest contiguous prefix
-	// chain any single pod holds counting from the first requested block.
+	// MaxPodHitCount counts, per lookup, the longest contiguous prefix chain
+	// any single pod holds counting from the first requested block.
 	MaxPodHitCount = newDualCounter("index", "max_pod_hit_count_total",
 		"kv_cache_index_max_pod_hit_count_total", "Longest contiguous per-pod prefix chain observed per lookup")
-	// LookupHits accumulates the same per-match contiguous chain length as
+	// LookupHits accumulates the same per-lookup contiguous chain length as
 	// MaxPodHitCount.
 	LookupHits = newDualCounter("index", "lookup_hits_total",
 		"kv_cache_index_lookup_hits_total", "Contiguous prefix blocks matched by the best pod per lookup")
+	// LookupLatency logs latency of lookup calls.
 	LookupLatency = newDualHistogram("index", "lookup_latency_seconds",
-		"kv_cache_index_lookup_latency_seconds",
-		"Duration of Lookup and WalkKeys calls in seconds, including WalkKeys callbacks", prometheus.DefBuckets)
+		"kv_cache_index_lookup_latency_seconds", "Latency of Lookup calls in seconds", prometheus.DefBuckets)
 
 	// DedupRemovedHashesSuppressed counts individual block hashes whose removal
 	// was suppressed by the kvevents reference-count dedup filter because another
@@ -204,6 +204,30 @@ var (
 		Help: metricsutil.HelpMsgWithStability(
 			"Number of worker shards (capacity) in the event processing pool", compbasemetrics.ALPHA),
 	})
+	// FullReportRepairSignals counts endpoint stream transitions consumed by
+	// precise-prefix full-report repair.
+	FullReportRepairSignals = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Subsystem: routerSubsystem, Name: "kv_cache_full_report_repair_signals_total",
+		Help: metricsutil.HelpMsgWithStability(
+			"Total number of endpoint stream transitions observed by full-report repair",
+			compbasemetrics.ALPHA),
+	}, []string{"event"})
+	// FullReportRepairRequests counts request bodies marked for a full KV-cache
+	// report, split by threshold or one-shot integrity bypass.
+	FullReportRepairRequests = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Subsystem: routerSubsystem, Name: "kv_cache_full_report_repair_requests_total",
+		Help: metricsutil.HelpMsgWithStability(
+			"Total number of requests marked for a full KV-cache report",
+			compbasemetrics.ALPHA),
+	}, []string{"reason"})
+	// FullReportRepairEligibleEndpoints tracks endpoints whose event-derived
+	// index is eligible for bounded request-driven repair.
+	FullReportRepairEligibleEndpoints = prometheus.NewGauge(prometheus.GaugeOpts{
+		Subsystem: routerSubsystem, Name: "kv_cache_full_report_repair_eligible_endpoints",
+		Help: metricsutil.HelpMsgWithStability(
+			"Number of endpoints eligible for request-driven full-report repair",
+			compbasemetrics.ALPHA),
+	})
 )
 
 // Collectors returns a slice of all registered Prometheus collectors.
@@ -215,6 +239,7 @@ func Collectors() []prometheus.Collector {
 		KVEventStoresSkipped, KVEventRemovalsSkipped,
 		SubscriberActive, SubscriberReconnections, MessagesReceived, ZMQErrors,
 		PoolQueueDepth, PoolCapacity,
+		FullReportRepairSignals, FullReportRepairRequests, FullReportRepairEligibleEndpoints,
 	}
 }
 

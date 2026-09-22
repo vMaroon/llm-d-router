@@ -1,5 +1,5 @@
 /*
-Copyright 2026 The llm-d Authors.
+Copyright 2026 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -66,36 +66,6 @@ func TestNewEndpointDispatchesEventWithNoPollers(t *testing.T) {
 
 	events = extractor.GetEvents()
 	require.Len(t, events, 2, "EndpointExtractor should receive EventDelete from ReleaseEndpoint")
-	assert.Equal(t, fwkdl.EventDelete, events[1].Type)
-}
-
-func TestReleaseEndpointContinuesWhenPublisherEndpointIsMissing(t *testing.T) {
-	extractor := extmocks.NewEndpointExtractor("test-extractor")
-	epSrc := notifications.NewEndpointDataSource(notifications.EndpointNotificationSourceType, "ep-source")
-
-	r := NewRuntime(1)
-	logger := newTestLogger(t)
-	cfg := &Config{
-		Sources: []DataSourceConfig{
-			{
-				Plugin:     epSrc,
-				Extractors: []fwkplugin.Plugin{extractor},
-			},
-		},
-	}
-	require.NoError(t, r.Configure(cfg, logger))
-
-	endpoint := r.NewEndpoint(context.Background(), &fwkdl.EndpointMetadata{
-		ID:      types.NamespacedName{Name: "pod1", Namespace: "default"},
-		Address: "1.2.3.4:5678",
-	})
-	require.NotNil(t, endpoint)
-
-	r.crossReplicaPub = &crossReplicaPublisher{syncer: &fakeSyncer{}}
-	r.ReleaseEndpoint(endpoint)
-
-	events := extractor.GetEvents()
-	require.Len(t, events, 2, "publisher miss must not skip endpoint cleanup")
 	assert.Equal(t, fwkdl.EventDelete, events[1].Type)
 }
 

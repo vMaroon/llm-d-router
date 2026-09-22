@@ -1,5 +1,5 @@
 /*
-Copyright 2026 The llm-d Authors.
+Copyright 2026 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -29,6 +29,16 @@ import (
 )
 
 var (
+	streamingAccountingRequests = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Subsystem: eppmetrics.LLMDRouterEndpointPickerSubsystem,
+		Name:      "streaming_accounting_requests_total",
+		Help:      "Requests using streaming decode accounting, by requested usage mode. Final-only requests require backend telemetry protection.",
+	}, []string{"producer_name", "usage_mode"})
+	streamingOutputObservations = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Subsystem: eppmetrics.LLMDRouterEndpointPickerSubsystem,
+		Name:      "streaming_output_observations_total",
+		Help:      "Cumulative output increases applied before end of stream. Counts observations, not tokens.",
+	}, []string{"producer_name"})
 	inflightRequests = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Subsystem: eppmetrics.LLMDRouterEndpointPickerSubsystem,
@@ -56,7 +66,7 @@ func registerMetrics(registerer prometheus.Registerer) error {
 	if registerer == nil {
 		return errors.New("inflight load metrics registerer is required")
 	}
-	for _, collector := range []prometheus.Collector{inflightRequests, inflightTokens} {
+	for _, collector := range []prometheus.Collector{inflightRequests, inflightTokens, streamingAccountingRequests, streamingOutputObservations} {
 		if err := registerer.Register(collector); err != nil {
 			var alreadyRegistered prometheus.AlreadyRegisteredError
 			if errors.As(err, &alreadyRegistered) && alreadyRegistered.ExistingCollector == collector {

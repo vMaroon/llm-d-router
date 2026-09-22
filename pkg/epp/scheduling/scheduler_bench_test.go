@@ -1,5 +1,5 @@
 /*
-Copyright 2026 The llm-d Authors.
+Copyright 2026 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -25,9 +25,7 @@ import (
 	"github.com/google/uuid"
 	k8stypes "k8s.io/apimachinery/pkg/types"
 
-	"github.com/llm-d/llm-d-router/pkg/epp/datalayer"
 	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
-	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/picker"
@@ -66,9 +64,6 @@ func BenchmarkSchedule(b *testing.B) {
 		b.Fatalf("prefix scorer setup: %v", err)
 	}
 	loraAffinityScorer := loraaffinity.NewLoraAffinityScorer()
-	datalayer.RegisterScopeSpecs([]fwkplugin.Plugin{
-		kvCacheUtilizationScorer, queueingScorer, prefixCacheScorer, loraAffinityScorer,
-	})
 
 	profile := NewSchedulerProfile().
 		WithScorers(

@@ -1,6 +1,5 @@
 /*
 Copyright 2025 The Kubernetes Authors.
-Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -34,9 +33,25 @@ type Modality = fwkrh.Modality
 
 const ModalityImage = fwkrh.ModalityImage
 
-type TokenizedRequest = fwkrh.TokenizedRequest
+type TokenizedPrompt = fwkrh.TokenizedPrompt
 
 type MultiModalFeature = fwkrh.MultiModalFeature
+
+// InputTokenEstimate uses token IDs when available, otherwise one estimated token
+// per raw request byte. The fallback includes JSON overhead, has no cache discount,
+// and is not an exact tokenizer result or a bound for multimodal expansion.
+func (r *InferenceRequest) InputTokenEstimate() int64 {
+	if r == nil || r.Body == nil {
+		return 0
+	}
+	if r.Body.TokenizedPrompt != nil {
+		return int64(r.Body.TokenizedPrompt.TokenCount())
+	}
+	if r.Body.Completions != nil && len(r.Body.Completions.Prompt.TokenIDs) > 0 {
+		return int64(len(r.Body.Completions.Prompt.TokenIDs))
+	}
+	return int64(max(r.RequestSizeBytes, 0))
+}
 
 // RequestObjectives represents the scheduling objectives parsed from the InferenceObjectiveSpec, to be used in scheduling decisions.
 type RequestObjectives struct {

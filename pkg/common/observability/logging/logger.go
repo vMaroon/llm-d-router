@@ -1,6 +1,5 @@
 /*
 Copyright 2025 The Kubernetes Authors.
-Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -34,16 +33,34 @@ import (
 // level can be adjusted after the controller-runtime delegation is fulfilled.
 var atomicLevel = uberzap.NewAtomicLevelAt(zapcore.InfoLevel)
 
-// LevelEncoder maps zap / logr verbosity levels to OTel severity_text.
-func LevelEncoder(l zapcore.Level, enc zapcore.PrimitiveArrayEncoder) {
-	enc.AppendString(SeverityText(l))
+func customLevelEncoder(l zapcore.Level, enc zapcore.PrimitiveArrayEncoder) {
+	if l >= 0 {
+		zapcore.LowercaseLevelEncoder(l, enc)
+		return
+	}
+
+	switch l {
+	case zapcore.Level(-1 * DEBUG): // -4
+		enc.AppendString("debug")
+	case zapcore.Level(-1 * TRACE): // -5
+		enc.AppendString("trace")
+	default:
+		if l >= zapcore.Level(-1*VERBOSE) { // >= -3 (i.e. V(1)-V(3))
+			enc.AppendString("info")
+		} else {
+			enc.AppendString("trace")
+		}
+	}
 }
 
-func InitSetupLogging(serviceName string) {
-	logger := NewLogger(
-		serviceName,
+func InitSetupLogging() {
+	config := uberzap.NewProductionEncoderConfig()
+	config.EncodeLevel = customLevelEncoder
+
+	logger := zap.New(
 		zap.Level(atomicLevel),
 		zap.RawZapOpts(uberzap.AddCaller()),
+		zap.Encoder(zapcore.NewJSONEncoder(config)),
 	)
 	ctrl.SetLogger(logger)
 }
