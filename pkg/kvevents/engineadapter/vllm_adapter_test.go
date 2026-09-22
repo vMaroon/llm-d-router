@@ -74,6 +74,19 @@ func TestVLLMParseMessage_Valid(t *testing.T) {
 	assert.Equal(t, uint64(99), blockStored.ParentHash)
 }
 
+func TestVLLMSnapshotParseMessageAcceptsDataParallelRank(t *testing.T) {
+	adapter := NewVLLMAdapter()
+	adapter.SnapshotMode = true
+	payload, err := msgpack.Marshal([]any{1234567890.0, []any{}, 37})
+	require.NoError(t, err)
+
+	_, _, _, err = adapter.ParseMessage(&kvevents.RawMessage{
+		Topic:   "kv@pod-1@model",
+		Payload: payload,
+	})
+	require.NoError(t, err)
+}
+
 // TestVLLMParseMessage_InvalidPayload tests error handling for invalid msgpack data.
 func TestVLLMParseMessage_InvalidPayload(t *testing.T) {
 	adapter := NewVLLMAdapter()

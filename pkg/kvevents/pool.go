@@ -22,6 +22,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	lru "github.com/hashicorp/golang-lru/v2"
 	"k8s.io/client-go/util/workqueue"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -83,6 +84,8 @@ func blockStoredEventDigestible(ev *BlockStoredEvent) (bool, string) {
 
 // Config holds the configuration for the event processing pool.
 type Config struct {
+	// SnapshotPort enables per-publisher vLLM snapshot recovery when nonzero.
+	SnapshotPort int `json:"snapshotPort,omitempty"`
 	// ZMQEndpoint is the ZMQ address to connect to (e.g., "tcp://indexer:5557").
 	ZMQEndpoint string `json:"zmqEndpoint,omitempty"`
 	// TopicFilter is the ZMQ subscription filter (e.g., "kv@").
@@ -161,7 +164,11 @@ type Pool struct {
 	// tier, KV-cache group, DP rank) and a store must be counted only after
 	// Index.Add succeeds — both of which only the Pool observes.
 	dedup *eventDedupFilter
-	wg    sync.WaitGroup
+	// strict makes incomplete event application fail snapshot reconstruction.
+	strict             bool
+	snapshotEntries    map[snapshotOwnedEntry]struct{}
+	snapshotEngineKeys *lru.Cache[kvblock.BlockHash, []kvblock.BlockHash]
+	wg                 sync.WaitGroup
 	// queueDepth mirrors the number of tasks queued across all shards. It is
 	// tracked incrementally rather than by summing queue.Len() so that the
 	// depth gauge stays O(1) on the enqueue/dequeue hot path.
@@ -177,6 +184,11 @@ type snapshotState struct {
 	generation uint64
 	failed     bool
 	active     bool
+}
+
+type snapshotOwnedEntry struct {
+	key   kvblock.BlockHash
+	entry kvblock.PodEntry
 }
 
 // NewPool creates a Pool with a sharded worker setup.
@@ -441,7 +453,9 @@ func (p *Pool) processRawMessage(ctx context.Context, msg *RawMessage) {
 		podID = msg.SourceEndpoint
 	}
 
-	p.processEventBatchWithGeneration(ctx, &batch, podID, modelName, msg.snapshotGeneration)
+	if err := p.processEventBatchWithGeneration(ctx, &batch, podID, modelName, msg.snapshotGeneration); err != nil {
+		logger.Error(err, "Failed to apply event batch")
+	}
 }
 
 func (p *Pool) isCurrentSnapshot(sourceEndpoint string, generation uint64) bool {
@@ -518,51 +532,67 @@ func realignExtraFeatures(engineFeatures []*kvblock.BlockExtraFeatures, canonica
 func (p *Pool) handleDeviceTierUpdate(
 	ctx context.Context, tokens []uint32, engineKeys []kvblock.BlockHash,
 	podEntries []kvblock.PodEntry, podIdentifier, deviceTier string, snapshotGeneration uint64,
-) bool {
+) (bool, error) {
 	debugLogger := log.FromContext(ctx).V(logging.DEBUG)
 
 	// Only attempt resolution when tokens are truly absent; partial-block
 	// events (tokens < blockSize) should just be skipped.
 	if len(tokens) != 0 || len(engineKeys) == 0 {
-		return false
+		return false, nil
 	}
 
 	seen := make(map[kvblock.BlockHash]struct{})
 	var resolvedKeys []kvblock.BlockHash
 	for _, ek := range engineKeys {
-		rk, err := p.index.GetRequestKey(ctx, ek)
+		var keys []kvblock.BlockHash
+		var err error
+		if p.strict {
+			keys, err = p.snapshotRequestKeys(ctx, ek)
+		} else {
+			var key kvblock.BlockHash
+			key, err = p.index.GetRequestKey(ctx, ek)
+			keys = []kvblock.BlockHash{key}
+		}
 		if err != nil {
+			if p.strict {
+				return false, err
+			}
 			continue
 		}
-		if _, ok := seen[rk]; !ok {
-			seen[rk] = struct{}{}
-			resolvedKeys = append(resolvedKeys, rk)
+		for _, key := range keys {
+			if _, ok := seen[key]; !ok {
+				seen[key] = struct{}{}
+				resolvedKeys = append(resolvedKeys, key)
+			}
 		}
 	}
 
 	if len(resolvedKeys) == 0 {
 		debugLogger.Info("no indexed engine keys found for device-tier update, skipping",
 			"podIdentifier", podIdentifier, "engineKeyCount", len(engineKeys))
-		return false
+		return false, nil
 	}
 
 	if err := p.index.Add(ctx, nil, resolvedKeys, podEntries); err != nil {
 		debugLogger.Error(err, "Failed to add device-tier update to index",
 			"podIdentifier", podIdentifier, "deviceTier", deviceTier)
 		p.notifyStreamEvent(podIdentifier, StreamEventProcessingFailure, snapshotGeneration)
-		return false
+		return false, err
 	}
-	return true
+	if p.strict {
+		p.trackSnapshotStore(resolvedKeys, podEntries)
+	}
+	return true, nil
 }
 
 // processEventBatch processes a batch of events using type switches.
-func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIdentifier, modelName string) {
-	p.processEventBatchWithGeneration(ctx, batch, podIdentifier, modelName, 0)
+func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIdentifier, modelName string) error {
+	return p.processEventBatchWithGeneration(ctx, batch, podIdentifier, modelName, 0)
 }
 
 func (p *Pool) processEventBatchWithGeneration(
 	ctx context.Context, batch *EventBatch, podIdentifier, modelName string, snapshotGeneration uint64,
-) {
+) error {
 	debugLogger := log.FromContext(ctx).V(logging.DEBUG)
 	debugLogger.V(logging.TRACE).Info("Processing event batch",
 		"podID", podIdentifier,
@@ -634,8 +664,21 @@ func (p *Pool) processEventBatchWithGeneration(
 			parentRequestKey := kvblock.EmptyBlockHash
 			if ev.ParentHash != 0 {
 				parentEngineKey := kvblock.BlockHash(ev.ParentHash)
-				key, err := p.index.GetRequestKey(ctx, parentEngineKey)
+				var key kvblock.BlockHash
+				var err error
+				if p.strict {
+					var keys []kvblock.BlockHash
+					keys, err = p.snapshotRequestKeys(ctx, parentEngineKey)
+					if err == nil {
+						key = keys[len(keys)-1]
+					}
+				} else {
+					key, err = p.index.GetRequestKey(ctx, parentEngineKey)
+				}
 				if err != nil {
+					if p.strict {
+						return err
+					}
 					debugLogger.Error(err, "Failed to get request key for parent block",
 						"parentEngineKey", parentEngineKey,
 						"effectiveModelName", effectiveModelName,
@@ -655,6 +698,9 @@ func (p *Pool) processEventBatchWithGeneration(
 				var err error
 				extraFeatures, err = kvblock.ParseRawExtraKeys(ev.ExtraKeys)
 				if err != nil {
+					if p.strict {
+						return err
+					}
 					debugLogger.Error(err, "Failed to parse extra keys",
 						"podIdentifier", podIdentifier)
 					p.notifyStreamEvent(podIdentifier, StreamEventProcessingFailure, snapshotGeneration)
@@ -705,6 +751,9 @@ func (p *Pool) processEventBatchWithGeneration(
 			requestKeys, err := p.tokenProcessor.TokensToKVBlockKeys(
 				parentRequestKey, ev.Tokens, effectiveModelName, extraFeatures)
 			if err != nil {
+				if p.strict {
+					return err
+				}
 				debugLogger.Error(err, "Failed to generate request keys",
 					"podIdentifier", podIdentifier, "effectiveModelName", effectiveModelName)
 				p.notifyStreamEvent(podIdentifier, StreamEventProcessingFailure, snapshotGeneration)
@@ -712,9 +761,13 @@ func (p *Pool) processEventBatchWithGeneration(
 			}
 
 			if len(requestKeys) == 0 {
-				if p.handleDeviceTierUpdate(
+				stored, err := p.handleDeviceTierUpdate(
 					ctx, ev.Tokens, engineKeys, podEntries, podIdentifier, deviceTier, snapshotGeneration,
-				) {
+				)
+				if err != nil && p.strict {
+					return err
+				}
+				if stored {
 					p.dedup.trackStore(storeScope, ev.BlockHashes)
 				}
 				continue
@@ -722,11 +775,27 @@ func (p *Pool) processEventBatchWithGeneration(
 
 			// Index.Add infers the engine->request mapping from the ratio of
 			// len(engineKeys) to len(requestKeys) (1:1, many:1, or 1:many).
-			if err := p.index.Add(ctx, engineKeys, requestKeys, podEntries); err != nil {
+			storedEngineKeys := engineKeys
+			if p.strict {
+				// Validate and install generation-local reconstruction metadata
+				// before publishing entries to the shared request-key index. This
+				// keeps a malformed strict store from leaving an untracked entry.
+				if err := p.trackSnapshotEngineKeys(engineKeys, requestKeys); err != nil {
+					return err
+				}
+				storedEngineKeys = nil
+			}
+			if err := p.index.Add(ctx, storedEngineKeys, requestKeys, podEntries); err != nil {
+				if p.strict {
+					return err
+				}
 				debugLogger.Error(err, "Failed to add event to index",
 					"podIdentifier", podIdentifier, "event", ev)
 				p.notifyStreamEvent(podIdentifier, StreamEventProcessingFailure, snapshotGeneration)
 				continue
+			}
+			if p.strict {
+				p.trackSnapshotStore(requestKeys, podEntries)
 			}
 			p.dedup.trackStore(storeScope, ev.BlockHashes)
 
@@ -785,20 +854,53 @@ func (p *Pool) processEventBatchWithGeneration(
 					"received", len(ev.BlockHashes), "forwarded", len(hashesToEvict), "suppressed", suppressed)
 			}
 
-			// Iterate over the surviving hashes and evict each key.
-			// The Index handles engine->request key resolution internally for both
-			// 1:1 (legacy) and 1:many (canonical) mappings.
+			// Iterate over the surviving hashes and evict each key. Strict snapshot
+			// pools resolve through generation-local metadata so another publisher
+			// cannot alter the canonical span for the same engine hash.
 			for _, hash := range hashesToEvict {
 				engineKey := kvblock.BlockHash(hash)
-				if err := p.index.Evict(ctx, engineKey, kvblock.EngineKey, podEntries); err != nil {
-					debugLogger.Error(err, "Failed to evict engine key from index",
+				var requestKeys []kvblock.BlockHash
+				if p.strict {
+					var err error
+					requestKeys, err = p.snapshotRequestKeys(ctx, engineKey)
+					if err != nil {
+						return err
+					}
+				}
+				keyType := kvblock.EngineKey
+				keys := []kvblock.BlockHash{engineKey}
+				if p.strict {
+					keyType = kvblock.RequestKey
+					keys = requestKeys
+				}
+				var evictErr error
+				for _, key := range keys {
+					if err := p.index.Evict(ctx, key, keyType, podEntries); err != nil {
+						evictErr = err
+						break
+					}
+				}
+				if evictErr != nil {
+					if p.strict {
+						return evictErr
+					}
+					debugLogger.Error(evictErr, "Failed to evict engine key from index",
 						"podIdentifier", podIdentifier, "engineKey", engineKey)
 					p.notifyStreamEvent(podIdentifier, StreamEventProcessingFailure, snapshotGeneration)
 					continue
 				}
+				if p.strict {
+					p.untrackSnapshotStore(requestKeys, podEntries)
+				}
 			}
 
 		case *AllBlocksClearedEvent:
+			if p.strict {
+				if err := p.clearSnapshotGPU(ctx, podIdentifier); err != nil {
+					return err
+				}
+				continue
+			}
 			debugLogger.Info("All blocks cleared event received",
 				"podIdentifier", podIdentifier,
 				"deviceTier", ev.DeviceTier,
@@ -831,4 +933,5 @@ func (p *Pool) processEventBatchWithGeneration(
 			debugLogger.Info("Unknown event", "podIdentifier", podIdentifier, "event", genericEvent)
 		}
 	}
+	return nil
 }
