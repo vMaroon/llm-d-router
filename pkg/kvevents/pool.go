@@ -165,7 +165,10 @@ type Pool struct {
 	// Index.Add succeeds — both of which only the Pool observes.
 	dedup *eventDedupFilter
 	// strict makes incomplete event application fail snapshot reconstruction.
-	strict             bool
+	strict bool
+	// ownsEntries records the index entries this pool adds, so a publisher
+	// generation can be cleared when its stream ends.
+	ownsEntries        bool
 	snapshotEntries    map[snapshotOwnedEntry]struct{}
 	snapshotEngineKeys *lru.Cache[kvblock.BlockHash, []kvblock.BlockHash]
 	wg                 sync.WaitGroup
@@ -579,7 +582,7 @@ func (p *Pool) handleDeviceTierUpdate(
 		p.notifyStreamEvent(podIdentifier, StreamEventProcessingFailure, snapshotGeneration)
 		return false, err
 	}
-	if p.strict {
+	if p.ownsEntries {
 		p.trackSnapshotStore(resolvedKeys, podEntries)
 	}
 	return true, nil
@@ -794,7 +797,7 @@ func (p *Pool) processEventBatchWithGeneration(
 				p.notifyStreamEvent(podIdentifier, StreamEventProcessingFailure, snapshotGeneration)
 				continue
 			}
-			if p.strict {
+			if p.ownsEntries {
 				p.trackSnapshotStore(requestKeys, podEntries)
 			}
 			p.dedup.trackStore(storeScope, ev.BlockHashes)
@@ -889,7 +892,7 @@ func (p *Pool) processEventBatchWithGeneration(
 					p.notifyStreamEvent(podIdentifier, StreamEventProcessingFailure, snapshotGeneration)
 					continue
 				}
-				if p.strict {
+				if p.ownsEntries {
 					p.untrackSnapshotStore(requestKeys, podEntries)
 				}
 			}

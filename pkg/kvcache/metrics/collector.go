@@ -175,6 +175,12 @@ var (
 			"Number of snapshot publishers with a complete current index",
 			compbasemetrics.ALPHA),
 	})
+	LiveOnlyPublishers = prometheus.NewGauge(prometheus.GaugeOpts{
+		Subsystem: routerSubsystem, Name: "kv_cache_events_live_only_publishers",
+		Help: metricsutil.HelpMsgWithStability(
+			"Number of publishers without a snapshot endpoint served from live events only",
+			compbasemetrics.ALPHA),
+	})
 	SnapshotRecoveries = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Subsystem: routerSubsystem, Name: "kv_cache_events_snapshot_recoveries_total",
 		Help: metricsutil.HelpMsgWithStability(
@@ -256,7 +262,7 @@ func Collectors() []prometheus.Collector {
 		LookupRequests, LookupHits, LookupLatency, MaxPodHitCount,
 		DedupRemovedHashesSuppressed, DedupRemovedHashesForwarded,
 		KVEventStoresSkipped, KVEventRemovalsSkipped,
-		SubscriberActive, SnapshotReady, SnapshotRecoveries, SnapshotBootstrapDuration,
+		SubscriberActive, SnapshotReady, LiveOnlyPublishers, SnapshotRecoveries, SnapshotBootstrapDuration,
 		SubscriberReconnections, MessagesReceived, ZMQErrors,
 		PoolQueueDepth, PoolCapacity,
 		FullReportRepairSignals, FullReportRepairRequests, FullReportRepairEligibleEndpoints,
