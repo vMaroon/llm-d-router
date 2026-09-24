@@ -168,7 +168,10 @@ type Pool struct {
 	strict bool
 	// ownsEntries records the index entries this pool adds, so a publisher
 	// generation can be cleared when its stream ends.
-	ownsEntries        bool
+	ownsEntries bool
+	// staged keeps a strict pool's writes out of the shared index and only
+	// tracks the owned entries; publishStaged installs them in bulk.
+	staged             bool
 	snapshotEntries    map[snapshotOwnedEntry]struct{}
 	snapshotEngineKeys *lru.Cache[kvblock.BlockHash, []kvblock.BlockHash]
 	wg                 sync.WaitGroup
@@ -576,7 +579,7 @@ func (p *Pool) handleDeviceTierUpdate(
 		return false, nil
 	}
 
-	if err := p.index.Add(ctx, nil, resolvedKeys, podEntries); err != nil {
+	if err := p.indexAdd(ctx, nil, resolvedKeys, podEntries); err != nil {
 		debugLogger.Error(err, "Failed to add device-tier update to index",
 			"podIdentifier", podIdentifier, "deviceTier", deviceTier)
 		p.notifyStreamEvent(podIdentifier, StreamEventProcessingFailure, snapshotGeneration)
@@ -788,7 +791,7 @@ func (p *Pool) processEventBatchWithGeneration(
 				}
 				storedEngineKeys = nil
 			}
-			if err := p.index.Add(ctx, storedEngineKeys, requestKeys, podEntries); err != nil {
+			if err := p.indexAdd(ctx, storedEngineKeys, requestKeys, podEntries); err != nil {
 				if p.strict {
 					return err
 				}
@@ -878,7 +881,7 @@ func (p *Pool) processEventBatchWithGeneration(
 				}
 				var evictErr error
 				for _, key := range keys {
-					if err := p.index.Evict(ctx, key, keyType, podEntries); err != nil {
+					if err := p.indexEvict(ctx, key, keyType, podEntries); err != nil {
 						evictErr = err
 						break
 					}
