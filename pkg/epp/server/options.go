@@ -31,6 +31,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/client-go/tools/leaderelection"
 	ctrl "sigs.k8s.io/controller-runtime"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
@@ -39,9 +40,13 @@ import (
 )
 
 const (
-	DefaultGrpcPort           = 9002
-	DefaultPoolNamespace      = "default"        // default when pool namespace is empty (CLI flag default is empty)
-	DefaultDrainTimeout       = 30 * time.Second // graceful shutdown drain window
+	DefaultGrpcPort      = 9002
+	DefaultPoolNamespace = "default"        // default when pool namespace is empty (CLI flag default is empty)
+	DefaultDrainTimeout  = 30 * time.Second // graceful shutdown drain window
+	// Leader election timings, the controller-runtime defaults.
+	DefaultLeaseDuration      = 15 * time.Second
+	DefaultRenewDeadline      = 10 * time.Second
+	DefaultRetryPeriod        = 2 * time.Second
 	MinRefreshMetricsInterval = 50 * time.Millisecond
 )
 
@@ -68,6 +73,9 @@ type Options struct {
 	//
 	GRPCPort              int           // gRPC port used for communicating with Envoy proxy. (TODO: uint16?)
 	EnableLeaderElection  bool          // Enables leader election for high availability
+	LeaseDuration         time.Duration // How long a standby waits after the last renewal before taking the lease.
+	RenewDeadline         time.Duration // How long the leader keeps retrying a failed renewal before it gives up leadership.
+	RetryPeriod           time.Duration // Wait between leader election attempts.
 	DrainTimeout          time.Duration // Graceful shutdown drain window; ext_proc keeps serving this long after SIGTERM.
 	GRPCMaxRecvMsgSize    int           // Maximum size of a gRPC message to receive (parsed bytes).
 	GRPCMaxSendMsgSize    int           // Maximum size of a gRPC message to send (parsed bytes).
@@ -135,6 +143,9 @@ func NewOptions() *Options {
 	return &Options{ // "zero" values are no explicitly set
 		GRPCPort:                         DefaultGrpcPort,
 		DrainTimeout:                     DefaultDrainTimeout,
+		LeaseDuration:                    DefaultLeaseDuration,
+		RenewDeadline:                    DefaultRenewDeadline,
+		RetryPeriod:                      DefaultRetryPeriod,
 		PoolGroup:                        routing.InferencePoolAPIGroup,
 		EndpointTargetPorts:              []int{},
 		DisableEndpointSubsetFilter:      false,
@@ -166,6 +177,13 @@ func (opts *Options) AddFlags(fs *pflag.FlagSet) {
 	fs.IntVar(&opts.GRPCPort, "grpc-port", opts.GRPCPort, "gRPC port used for communicating with Envoy proxy.")
 	fs.BoolVar(&opts.EnableLeaderElection, "ha-enable-leader-election", opts.EnableLeaderElection,
 		"Enables leader election for high availability. When enabled, readiness probes will only pass on the leader.")
+	fs.DurationVar(&opts.LeaseDuration, "ha-lease-duration", opts.LeaseDuration,
+		"Leader election: how long a standby waits after the leader's last renewal before it takes the lease.")
+	fs.DurationVar(&opts.RenewDeadline, "ha-renew-deadline", opts.RenewDeadline,
+		"Leader election: how long the leader keeps retrying a failed lease renewal (for example against a slow "+
+			"API server) before it gives up leadership. Must be shorter than ha-lease-duration.")
+	fs.DurationVar(&opts.RetryPeriod, "ha-retry-period", opts.RetryPeriod,
+		"Leader election: wait between attempts to acquire or renew the lease.")
 	fs.DurationVar(&opts.DrainTimeout, "drain-timeout", opts.DrainTimeout,
 		"Graceful shutdown drain window. On SIGTERM the EPP goes NotServing and releases its leader lease "+
 			"immediately, then keeps serving ext_proc for this duration so in-flight and pre-DNS-refresh requests "+
@@ -391,6 +409,20 @@ func (opts *Options) Validate() error {
 		ctrl.Log.WithName("options").Info("Warning: refresh-metrics-interval below minimum, clamped",
 			"requested", opts.RefreshMetricsInterval, "effective", MinRefreshMetricsInterval)
 		opts.RefreshMetricsInterval = MinRefreshMetricsInterval
+	}
+	// The client-go leader elector refuses these at startup; report them as flag errors instead.
+	if opts.EnableLeaderElection {
+		if opts.RetryPeriod <= 0 {
+			return fmt.Errorf("ha-retry-period must be positive, got %s", opts.RetryPeriod)
+		}
+		if opts.RenewDeadline <= time.Duration(leaderelection.JitterFactor*float64(opts.RetryPeriod)) {
+			return fmt.Errorf("ha-renew-deadline (%s) must be greater than %.1f x ha-retry-period (%s)",
+				opts.RenewDeadline, leaderelection.JitterFactor, opts.RetryPeriod)
+		}
+		if opts.LeaseDuration <= opts.RenewDeadline {
+			return fmt.Errorf("ha-lease-duration (%s) must be greater than ha-renew-deadline (%s)",
+				opts.LeaseDuration, opts.RenewDeadline)
+		}
 	}
 	if opts.GRPCMaxRecvMsgSize < 0 {
 		return fmt.Errorf("grpc-max-recv-msg-size must be non-negative, got %d", opts.GRPCMaxRecvMsgSize)

@@ -513,3 +513,51 @@ func TestParseCipherSuites(t *testing.T) {
 	_, err = parseCipherSuites([]string{"BOGUS"})
 	require.Error(t, err)
 }
+
+func TestLeaderElectionTimingFlags(t *testing.T) {
+	def := NewOptions()
+	def.AddFlags(pflag.NewFlagSet("default", pflag.ContinueOnError))
+	if def.LeaseDuration != DefaultLeaseDuration || def.RenewDeadline != DefaultRenewDeadline || def.RetryPeriod != DefaultRetryPeriod {
+		t.Errorf("defaults = %v/%v/%v, want %v/%v/%v", def.LeaseDuration, def.RenewDeadline, def.RetryPeriod,
+			DefaultLeaseDuration, DefaultRenewDeadline, DefaultRetryPeriod)
+	}
+
+	opts := NewOptions()
+	fs := pflag.NewFlagSet("set", pflag.ContinueOnError)
+	opts.AddFlags(fs)
+	if err := fs.Parse([]string{"--ha-enable-leader-election", "--ha-lease-duration=40s", "--ha-renew-deadline=30s", "--ha-retry-period=2s"}); err != nil {
+		t.Fatalf("Parse() failed: %v", err)
+	}
+	opts.PoolName = testPoolName
+	if err := opts.Validate(); err != nil {
+		t.Fatalf("Validate() failed: %v", err)
+	}
+	if opts.LeaseDuration != 40*time.Second || opts.RenewDeadline != 30*time.Second || opts.RetryPeriod != 2*time.Second {
+		t.Errorf("parsed = %v/%v/%v, want 40s/30s/2s", opts.LeaseDuration, opts.RenewDeadline, opts.RetryPeriod)
+	}
+}
+
+func TestValidateLeaderElectionTimings(t *testing.T) {
+	for _, tc := range []struct {
+		name                  string
+		lease, renew, retry   time.Duration
+		leaderElection, valid bool
+	}{
+		{name: "defaults", lease: DefaultLeaseDuration, renew: DefaultRenewDeadline, retry: DefaultRetryPeriod, leaderElection: true, valid: true},
+		{name: "renew equals lease", lease: 30 * time.Second, renew: 30 * time.Second, retry: 2 * time.Second, leaderElection: true},
+		{name: "renew within jitter of retry", lease: 30 * time.Second, renew: 2 * time.Second, retry: 2 * time.Second, leaderElection: true},
+		{name: "zero retry", lease: 30 * time.Second, renew: 20 * time.Second, leaderElection: true},
+		{name: "ignored without leader election", lease: time.Second, renew: 30 * time.Second, retry: 2 * time.Second, valid: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := NewOptions()
+			opts.AddFlags(pflag.NewFlagSet("test", pflag.ContinueOnError))
+			opts.PoolName = testPoolName
+			opts.EnableLeaderElection = tc.leaderElection
+			opts.LeaseDuration, opts.RenewDeadline, opts.RetryPeriod = tc.lease, tc.renew, tc.retry
+			if err := opts.Validate(); (err == nil) != tc.valid {
+				t.Errorf("Validate() error = %v, want valid = %v", err, tc.valid)
+			}
+		})
+	}
+}

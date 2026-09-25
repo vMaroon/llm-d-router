@@ -406,7 +406,11 @@ func (r *Runner) setup(ctx context.Context, cfg *rest.Config, opts *runserver.Op
 	isLeader := &atomic.Bool{}
 	isLeader.Store(false)
 
-	mgr, err := runserver.NewDefaultManager(controllerCfg, *gknn, cfg, metricsServerOptions, opts.EnableLeaderElection, managerOverrides...)
+	leaseTimings := func(o *ctrl.Options) {
+		o.LeaseDuration, o.RenewDeadline, o.RetryPeriod = &opts.LeaseDuration, &opts.RenewDeadline, &opts.RetryPeriod
+	}
+	overrides := append([]func(*ctrl.Options){leaseTimings}, managerOverrides...)
+	mgr, err := runserver.NewDefaultManager(controllerCfg, *gknn, cfg, metricsServerOptions, opts.EnableLeaderElection, overrides...)
 	if err != nil {
 		setupLog.Error(err, "Failed to create controller manager")
 		return nil, nil, err
