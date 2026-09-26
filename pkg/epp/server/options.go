@@ -73,6 +73,7 @@ type Options struct {
 	//
 	GRPCPort              int           // gRPC port used for communicating with Envoy proxy. (TODO: uint16?)
 	EnableLeaderElection  bool          // Enables leader election for high availability
+	LeaseName             string        // Leader election lease name; empty derives epp-<namespace>-<pool>.llm-d.ai.
 	LeaseDuration         time.Duration // How long a standby waits after the last renewal before taking the lease.
 	RenewDeadline         time.Duration // How long the leader keeps retrying a failed renewal before it gives up leadership.
 	RetryPeriod           time.Duration // Wait between leader election attempts.
@@ -177,6 +178,9 @@ func (opts *Options) AddFlags(fs *pflag.FlagSet) {
 	fs.IntVar(&opts.GRPCPort, "grpc-port", opts.GRPCPort, "gRPC port used for communicating with Envoy proxy.")
 	fs.BoolVar(&opts.EnableLeaderElection, "ha-enable-leader-election", opts.EnableLeaderElection,
 		"Enables leader election for high availability. When enabled, readiness probes will only pass on the leader.")
+	fs.StringVar(&opts.LeaseName, "ha-lease-name", opts.LeaseName,
+		"Leader election: name of the Lease in the pool namespace. Defaults to epp-<pool-namespace>-<pool-name>.llm-d.ai. "+
+			"Give a replacement EPP deployment for the same pool its own lease so both can hold leadership while traffic moves.")
 	fs.DurationVar(&opts.LeaseDuration, "ha-lease-duration", opts.LeaseDuration,
 		"Leader election: how long a standby waits after the leader's last renewal before it takes the lease.")
 	fs.DurationVar(&opts.RenewDeadline, "ha-renew-deadline", opts.RenewDeadline,

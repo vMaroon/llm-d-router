@@ -408,6 +408,9 @@ func (r *Runner) setup(ctx context.Context, cfg *rest.Config, opts *runserver.Op
 
 	leaseTimings := func(o *ctrl.Options) {
 		o.LeaseDuration, o.RenewDeadline, o.RetryPeriod = &opts.LeaseDuration, &opts.RenewDeadline, &opts.RetryPeriod
+		if opts.LeaseName != "" {
+			o.LeaderElectionID = opts.LeaseName
+		}
 	}
 	overrides := append([]func(*ctrl.Options){leaseTimings}, managerOverrides...)
 	mgr, err := runserver.NewDefaultManager(controllerCfg, *gknn, cfg, metricsServerOptions, opts.EnableLeaderElection, overrides...)
