@@ -400,6 +400,7 @@ func (p *Processor) dispatchCycle(ctx context.Context) bool {
 	prefill = append(prefill, interleaved...)
 	decode = append(decode, interleaved...)
 
+	poolCtx := flowcontrol.WithSaturationPool(ctx, pool)
 	saturation := -1.0
 	for _, part := range []struct {
 		name      string
@@ -413,14 +414,14 @@ func (p *Processor) dispatchCycle(ctx context.Context) bool {
 			metrics.DeleteFlowControlDetectorSaturationStage(part.name)
 			continue
 		}
-		stageSat := p.saturationDetector.Saturation(flowcontrol.WithSaturationStage(ctx, part.name), part.endpoints)
+		stageSat := p.saturationDetector.Saturation(flowcontrol.WithSaturationStage(poolCtx, part.name), part.endpoints)
 		metrics.RecordFlowControlPoolSaturation(p.poolName, part.name, stageSat)
 		if stageSat > saturation {
 			saturation = stageSat
 		}
 	}
 	if saturation < 0 {
-		saturation = p.saturationDetector.Saturation(ctx, pool)
+		saturation = p.saturationDetector.Saturation(poolCtx, pool)
 	}
 
 	metrics.RecordFlowControlPoolSaturation(p.poolName, "effective", saturation)

@@ -141,6 +141,20 @@ func SaturationStageFromContext(ctx context.Context) string {
 	return stage
 }
 
+type saturationPoolKey struct{}
+
+// WithSaturationPool returns a context carrying every endpoint of the pool, so a detector
+// evaluated for one stage can read load held by endpoints of the other stage.
+func WithSaturationPool(ctx context.Context, pool []datalayer.Endpoint) context.Context {
+	return context.WithValue(ctx, saturationPoolKey{}, pool)
+}
+
+// SaturationPoolFromContext returns the endpoints set by WithSaturationPool, or nil when unset.
+func SaturationPoolFromContext(ctx context.Context) []datalayer.Endpoint {
+	pool, _ := ctx.Value(saturationPoolKey{}).([]datalayer.Endpoint)
+	return pool
+}
+
 // DispatchReservationTracker closes the observation gap between flow-control dispatch and the
 // request lifecycle hooks that publish in-flight load. A reservation is created immediately
 // before a request is released from the flow-control queue and removed after PreRequest hooks
