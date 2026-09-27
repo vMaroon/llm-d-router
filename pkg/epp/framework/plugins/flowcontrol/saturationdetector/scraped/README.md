@@ -7,7 +7,7 @@ replica in front of the same pool reads the same scraped state, so the signal ne
 counters between replicas.
 
 ```
-saturation = (sum over pool endpoints of running + waiting  +  own recent dispatches)
+saturation = (sum over pool endpoints of running + waiting  +  ownDispatchWeight x own recent dispatches)
              / (maxConcurrency * candidates with fresh metrics)
 ```
 
@@ -28,6 +28,7 @@ saturation = (sum over pool endpoints of running + waiting  +  own recent dispat
 | `maxConcurrency` | `100` | In-flight requests one candidate endpoint is sized to hold. |
 | `metricsStalenessThreshold` | `2s` | Age after which an endpoint's metrics are stale. |
 | `ownDispatchWindow` | `1s` | How long a dispatched request counts before the scrape is trusted to include it. |
+| `ownDispatchWeight` | `1` | Multiplier on own recent dispatches; the number of router replicas bounds each replica to its share of room it cannot see peers claim. |
 
 ## Example
 

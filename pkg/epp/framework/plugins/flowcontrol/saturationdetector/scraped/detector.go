@@ -89,7 +89,8 @@ func NewDetector(name string, cfg Config, logger logr.Logger) *Detector {
 	pluginLogger.V(logutil.DEFAULT).Info("Creating new ScrapedConcurrencyDetector",
 		"maxConcurrency", cfg.MaxConcurrency,
 		"metricsStalenessThreshold", cfg.MetricsStalenessThreshold.String(),
-		"ownDispatchWindow", cfg.OwnDispatchWindow.String())
+		"ownDispatchWindow", cfg.OwnDispatchWindow.String(),
+		"ownDispatchWeight", cfg.OwnDispatchWeight)
 	return &Detector{
 		config:    cfg,
 		typedName: typedName,
@@ -106,7 +107,7 @@ func (d *Detector) TypedName() fwkplugin.TypedName {
 
 // Saturation returns
 //
-//	(scraped running + waiting on every pool endpoint + own recent dispatches) /
+//	(scraped running + waiting on every pool endpoint + OwnDispatchWeight * own recent dispatches) /
 //	(MaxConcurrency * candidates with fresh metrics)
 //
 // The candidates are the endpoints of the stage being evaluated and supply the capacity. The
@@ -157,8 +158,8 @@ func (d *Detector) Saturation(ctx context.Context, candidates []datalayer.Endpoi
 	if fresh == 0 {
 		return 1.0
 	}
-	inflight += int64(d.ownRecent(now))
-	return float64(inflight) / float64(fresh*d.config.MaxConcurrency)
+	load := float64(inflight) + d.config.OwnDispatchWeight*float64(d.ownRecent(now))
+	return load / float64(fresh*d.config.MaxConcurrency)
 }
 
 // ReserveDispatch records a request this router released. It counts for OwnDispatchWindow,

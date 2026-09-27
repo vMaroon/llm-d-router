@@ -107,12 +107,20 @@ func TestOwnDispatchesCountUntilWindowExpires(t *testing.T) {
 	require.InDelta(t, 2.0/10.0, d.Saturation(context.Background(), fresh), 1e-9)
 }
 
+func TestOwnDispatchWeight(t *testing.T) {
+	d := newTestDetector(t, `{"maxConcurrency": 5, "ownDispatchWeight": 2}`)
+	decode := []fwkdl.Endpoint{endpoint("d0", 1, 0, t0), endpoint("d1", 0, 0, t0)}
+	require.False(t, d.ReserveDispatch("a"))
+	// (1 scraped + 2 * 1 own) / 10
+	require.InDelta(t, 3.0/10.0, d.Saturation(context.Background(), decode), 1e-9)
+}
+
 func TestBuildConfig(t *testing.T) {
 	cfg, err := buildConfig(nil)
 	require.NoError(t, err)
-	require.Equal(t, Config{MaxConcurrency: 100, MetricsStalenessThreshold: 2 * time.Second, OwnDispatchWindow: time.Second}, *cfg)
+	require.Equal(t, Config{MaxConcurrency: 100, MetricsStalenessThreshold: 2 * time.Second, OwnDispatchWindow: time.Second, OwnDispatchWeight: 1}, *cfg)
 
-	for _, bad := range []string{`{"maxConcurrency": 0}`, `{"metricsStalenessThreshold": "0s"}`, `{"ownDispatchWindow": "-1s"}`} {
+	for _, bad := range []string{`{"maxConcurrency": 0}`, `{"metricsStalenessThreshold": "0s"}`, `{"ownDispatchWindow": "-1s"}`, `{"ownDispatchWeight": 0.5}`} {
 		var api apiConfig
 		require.NoError(t, json.NewDecoder(strings.NewReader(bad)).Decode(&api))
 		_, err := buildConfig(&api)

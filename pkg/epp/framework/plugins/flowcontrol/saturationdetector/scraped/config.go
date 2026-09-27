@@ -51,6 +51,12 @@ type apiConfig struct {
 	//
 	// Defaults to 1s if unset.
 	OwnDispatchWindow *metav1.Duration `json:"ownDispatchWindow,omitempty"`
+	// OwnDispatchWeight multiplies this router's recent dispatches. Peers' dispatches in the same
+	// window are invisible, so setting it to the number of router replicas makes each replica claim
+	// at most its share of free capacity it cannot yet see being claimed.
+	//
+	// Defaults to 1 if unset.
+	OwnDispatchWeight *float64 `json:"ownDispatchWeight,omitempty"`
 }
 
 // Config is the internal, fully-validated configuration used by the detector.
@@ -58,6 +64,7 @@ type Config struct {
 	MaxConcurrency            int64
 	MetricsStalenessThreshold time.Duration
 	OwnDispatchWindow         time.Duration
+	OwnDispatchWeight         float64
 }
 
 func buildConfig(apiCfg *apiConfig) (*Config, error) {
@@ -74,6 +81,9 @@ func buildConfig(apiCfg *apiConfig) (*Config, error) {
 	if cfg.OwnDispatchWindow == nil {
 		cfg.OwnDispatchWindow = &metav1.Duration{Duration: defaultOwnDispatchWindow}
 	}
+	if cfg.OwnDispatchWeight == nil {
+		cfg.OwnDispatchWeight = ptr.To(1.0)
+	}
 
 	var errs []error
 	if *cfg.MaxConcurrency <= 0 {
@@ -86,6 +96,9 @@ func buildConfig(apiCfg *apiConfig) (*Config, error) {
 	if cfg.OwnDispatchWindow.Duration < 0 {
 		errs = append(errs, fmt.Errorf("ownDispatchWindow must be non-negative, got %v", cfg.OwnDispatchWindow.Duration))
 	}
+	if *cfg.OwnDispatchWeight < 1 {
+		errs = append(errs, fmt.Errorf("ownDispatchWeight must be at least 1, got %v", *cfg.OwnDispatchWeight))
+	}
 	if err := errors.Join(errs...); err != nil {
 		return nil, fmt.Errorf("invalid scraped concurrency detector configuration: %w", err)
 	}
@@ -94,5 +107,6 @@ func buildConfig(apiCfg *apiConfig) (*Config, error) {
 		MaxConcurrency:            *cfg.MaxConcurrency,
 		MetricsStalenessThreshold: cfg.MetricsStalenessThreshold.Duration,
 		OwnDispatchWindow:         cfg.OwnDispatchWindow.Duration,
+		OwnDispatchWeight:         *cfg.OwnDispatchWeight,
 	}, nil
 }
