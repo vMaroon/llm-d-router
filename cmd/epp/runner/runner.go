@@ -68,6 +68,7 @@ import (
 	attrprefix "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/prefix"
 	attrsession "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/session"
 	attrtopology "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/topology"
+	redisstore "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/cross_plugin/redis"
 	discoveryfile "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/discovery/file"
 	extdcgm "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/extractor/dcgm"
 	extractormetrics "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/extractor/metrics"
@@ -721,6 +722,7 @@ func (r *Runner) registerInTreePlugins() {
 	fwkplugin.Register(concurrency.ConcurrencyDetectorType, fwkplugin.StabilityBeta, concurrency.ConcurrencyDetectorFactory)
 	fwkplugin.Register(utilization.UtilizationDetectorType, fwkplugin.StabilityBeta, utilization.UtilizationDetectorFactory)
 	fwkplugin.Register(scraped.ScrapedConcurrencyDetectorType, fwkplugin.StabilityAlpha, scraped.ScrapedConcurrencyDetectorFactory)
+	fwkplugin.Register(redisstore.RedisStateStoreType, fwkplugin.StabilityAlpha, redisstore.RedisStateStoreFactory)
 	fwkplugin.RegisterWithPluginDependencies(composite.MaxSaturationDetectorType, fwkplugin.StabilityBeta, composite.MaxSaturationDetectorFactory, composite.MaxSaturationDetectorConfigParser)
 
 	// register discovery plugins

@@ -509,16 +509,7 @@ func (r *Runtime) dispatchEndpointEvent(ctx context.Context, logger logr.Logger,
 					}
 					switch processed.Type {
 					case fwkdl.EventAddOrUpdate:
-						processed.Endpoint.GetAttributes().Put(spec.AttributeKey, &fwkdl.DynamicAttribute{
-							Get: func() fwkdl.Cloneable {
-								if val, ok, _ := r.syncer.Get(ctx, spec.StateKey, endpointID, spec.Aggregate); ok {
-									if c, ok := val.(fwkdl.Cloneable); ok {
-										return c
-									}
-								}
-								return nil
-							},
-						})
+						processed.Endpoint.GetAttributes().Put(spec.AttributeKey, crossReplicaAttribute(ctx, r.syncer, spec, endpointID))
 					case fwkdl.EventDelete:
 						if err := r.syncer.Delete(ctx, spec.StateKey, endpointID); err != nil {
 							logger.Error(err, "failed to delete shared state", "extractor", ext.TypedName(), "key", spec.StateKey)
@@ -613,3 +604,23 @@ func findUnique(sourceType string, hits ...sourceHit) (sourceHit, error) {
 
 var _ EndpointFactory = (*Runtime)(nil)
 var _ fwkdl.Registrar = (*Runtime)(nil)
+
+// crossReplicaAttribute resolves a contributor's attribute as the other replicas'
+// values from the syncer plus this replica's live value. When the syncer has
+// nothing fresh (for example while its backend is unreachable) the live local
+// value is used alone.
+func crossReplicaAttribute(ctx context.Context, syncer fwkdl.CrossReplicaSyncer, spec fwkdl.CrossReplicaSpec, endpointID string) *fwkdl.DynamicAttribute {
+	supply := spec.Supply(endpointID)
+	return &fwkdl.DynamicAttribute{
+		Get: func() fwkdl.Cloneable {
+			local := supply()
+			withLocal := func(peers []any) any { return spec.Aggregate(append(peers, local)) }
+			if val, ok, _ := syncer.Get(ctx, spec.StateKey, endpointID, withLocal); ok {
+				if c, ok := val.(fwkdl.Cloneable); ok {
+					return c
+				}
+			}
+			return local
+		},
+	}
+}
