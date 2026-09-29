@@ -94,7 +94,7 @@ func TestSnapshotBootstrapRetention(t *testing.T) {
 	adapter := engineadapter.NewVLLMAdapter()
 	adapter.SnapshotMode = true
 	indexCfg := &kvblock.IndexConfig{InMemoryConfig: &kvblock.InMemoryIndexConfig{Size: 10_000_000, PodCacheSize: 1024}}
-	manager, err := kvevents.NewSnapshotManager(cfg, indexCfg, tokens, adapter)
+	manager, err := kvevents.NewSnapshotManager(cfg, snapshotTestIndex(t, indexCfg), tokens, adapter)
 	require.NoError(t, err)
 	defer manager.Shutdown(ctx)
 

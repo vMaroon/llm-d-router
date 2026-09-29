@@ -47,8 +47,8 @@ const (
 	retryMaximum          = 30 * time.Second
 	maxConcurrentRecovery = 16
 	// Snapshot generations use one entry per publisher, tier, and cache group.
-	// Keep the shared index well above the ordinary request index's small
-	// per-key routing cache so recovery never silently drops publishers.
+	// SnapshotIndexConfig raises the index's per-key cap to this bound so
+	// recovery never silently drops publishers.
 	snapshotEntriesPerKey = 1 << 20
 	// Eviction is fail closed: a later event that references metadata older than
 	// this bounded history deactivates the generation and starts a fresh snapshot.
@@ -86,26 +86,36 @@ type snapshotSubscriber struct {
 	successes                               atomic.Uint64
 }
 
-func NewSnapshotManager(cfg *Config, indexCfg *kvblock.IndexConfig, tokens kvblock.TokenProcessor, adapter EngineAdapter) (*SnapshotManager, error) {
-	if err := registerSnapshotTransport(); err != nil {
-		return nil, err
-	}
-	if cfg.SnapshotPort < 1 || cfg.SnapshotPort > 65535 {
-		return nil, fmt.Errorf("invalid snapshotPort: %d", cfg.SnapshotPort)
-	}
+// SnapshotIndexConfig returns the index configuration snapshot recovery
+// requires: the in-memory index, with the per-key entry cap raised so recovery
+// never silently drops publishers. A nil config selects the default index.
+func SnapshotIndexConfig(indexCfg *kvblock.IndexConfig) (*kvblock.IndexConfig, error) {
 	if indexCfg == nil {
 		indexCfg = kvblock.DefaultIndexConfig()
 	}
 	if indexCfg.InMemoryConfig == nil || indexCfg.RedisConfig != nil || indexCfg.CostAwareMemoryConfig != nil {
 		return nil, fmt.Errorf("snapshot recovery requires the in-memory index")
 	}
-	snapshotIndexCfg := *indexCfg.InMemoryConfig
-	if snapshotIndexCfg.PodCacheSize < snapshotEntriesPerKey {
-		snapshotIndexCfg.PodCacheSize = snapshotEntriesPerKey
+	out := *indexCfg
+	inMemory := *indexCfg.InMemoryConfig
+	if inMemory.PodCacheSize < snapshotEntriesPerKey {
+		inMemory.PodCacheSize = snapshotEntriesPerKey
 	}
-	index, err := kvblock.NewInMemoryIndex(&snapshotIndexCfg)
-	if err != nil {
+	out.InMemoryConfig = &inMemory
+	return &out, nil
+}
+
+// NewSnapshotManager recovers publishers into index, which must be built from
+// SnapshotIndexConfig.
+func NewSnapshotManager(cfg *Config, index kvblock.Index, tokens kvblock.TokenProcessor, adapter EngineAdapter) (*SnapshotManager, error) {
+	if err := registerSnapshotTransport(); err != nil {
 		return nil, err
+	}
+	if cfg.SnapshotPort < 1 || cfg.SnapshotPort > 65535 {
+		return nil, fmt.Errorf("invalid snapshotPort: %d", cfg.SnapshotPort)
+	}
+	if index == nil {
+		return nil, fmt.Errorf("snapshot recovery requires an index")
 	}
 	metrics.Register()
 	return &SnapshotManager{

@@ -49,7 +49,7 @@ func TestSnapshotShutdownCancelsStalledHandshake(t *testing.T) {
 	cfg.SnapshotPort = 5559
 	tokens, err := kvblock.NewChunkedTokenDatabase(nil)
 	require.NoError(t, err)
-	manager, err := kvevents.NewSnapshotManager(cfg, nil, tokens, engineadapter.NewVLLMAdapter())
+	manager, err := kvevents.NewSnapshotManager(cfg, snapshotTestIndex(t, nil), tokens, engineadapter.NewVLLMAdapter())
 	require.NoError(t, err)
 	require.NoError(t, manager.EnsureSubscriber(ctx, "pod", "pod:8000", "tcp://"+listener.Addr().String(), "", "kv@", true))
 	var conn net.Conn
@@ -90,7 +90,7 @@ func TestSnapshotRetriesStalledHandshake(t *testing.T) {
 	cfg.SnapshotPort = 5559
 	tokens, err := kvblock.NewChunkedTokenDatabase(nil)
 	require.NoError(t, err)
-	manager, err := kvevents.NewSnapshotManager(cfg, nil, tokens, engineadapter.NewVLLMAdapter())
+	manager, err := kvevents.NewSnapshotManager(cfg, snapshotTestIndex(t, nil), tokens, engineadapter.NewVLLMAdapter())
 	require.NoError(t, err)
 	defer manager.Shutdown(ctx)
 	require.NoError(t, manager.EnsureSubscriber(ctx, "pod", "pod:8000", "tcp://"+listener.Addr().String(), "", "kv@", true))
@@ -112,7 +112,7 @@ func TestSilentPublishersDoNotHoldRecoverySlots(t *testing.T) {
 	cfg.SnapshotPort = 1
 	tokens, err := kvblock.NewChunkedTokenDatabase(nil)
 	require.NoError(t, err)
-	manager, err := kvevents.NewSnapshotManager(cfg, nil, tokens, engineadapter.NewVLLMAdapter())
+	manager, err := kvevents.NewSnapshotManager(cfg, snapshotTestIndex(t, nil), tokens, engineadapter.NewVLLMAdapter())
 	require.NoError(t, err)
 	defer manager.Shutdown(ctx)
 	listen := func() (zmq.Socket, string) {
@@ -137,4 +137,13 @@ func TestSilentPublishersDoNotHoldRecoverySlots(t *testing.T) {
 		_ = active.Send(zmq.NewMsgFrom([]byte("kv@127.0.0.1:8000@test-model"), seq, batch))
 		return manager.Status().LiveOnly == 1
 	}, 10*time.Second, 50*time.Millisecond)
+}
+
+func snapshotTestIndex(t *testing.T, indexCfg *kvblock.IndexConfig) kvblock.Index {
+	t.Helper()
+	indexCfg, err := kvevents.SnapshotIndexConfig(indexCfg)
+	require.NoError(t, err)
+	index, err := kvblock.NewIndex(context.Background(), indexCfg)
+	require.NoError(t, err)
+	return index
 }

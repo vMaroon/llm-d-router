@@ -228,6 +228,13 @@ func New(ctx context.Context, name string, config PluginConfig) (*Producer, erro
 		return nil, fmt.Errorf("failed to create token processor: %w", err)
 	}
 
+	if config.KVEventsConfig != nil && config.KVEventsConfig.SnapshotPort != 0 {
+		indexCfg, err := kvevents.SnapshotIndexConfig(config.IndexerConfig.KVBlockIndexConfig)
+		if err != nil {
+			return nil, err
+		}
+		config.IndexerConfig.KVBlockIndexConfig = indexCfg
+	}
 	indexer, err := kvcache.NewKVCacheIndexer(ctx, config.IndexerConfig, tokenProcessor)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create kvcache.Indexer: %w", err)
@@ -252,7 +259,7 @@ func New(ctx context.Context, name string, config PluginConfig) (*Producer, erro
 	if config.KVEventsConfig.SnapshotPort != 0 {
 		adapter := engineadapter.NewVLLMAdapter()
 		adapter.SnapshotMode = true
-		snapshots, err = kvevents.NewSnapshotManager(config.KVEventsConfig, config.IndexerConfig.KVBlockIndexConfig, tokenProcessor, adapter)
+		snapshots, err = kvevents.NewSnapshotManager(config.KVEventsConfig, indexer.KVBlockIndex(), tokenProcessor, adapter)
 		if err != nil {
 			return nil, err
 		}

@@ -85,7 +85,7 @@ func TestSnapshotManagerRetainsAllPublishersPerKey(t *testing.T) {
 	indexCfg.KVBlockIndexConfig.InMemoryConfig.PodCacheSize = 1
 	cfg := DefaultConfig()
 	cfg.SnapshotPort = 6000
-	manager, err := NewSnapshotManager(cfg, indexCfg.KVBlockIndexConfig, tokens, snapshotRankAdapter{})
+	manager, err := NewSnapshotManager(cfg, snapshotTestIndex(t, indexCfg.KVBlockIndexConfig), tokens, snapshotRankAdapter{})
 	require.NoError(t, err)
 
 	const publishers = 192
@@ -119,7 +119,7 @@ func TestSnapshotSubscriberOffsetsPortByLiveRank(t *testing.T) {
 	cfg.SnapshotPort = 6000
 	tokens, err := kvblock.NewChunkedTokenDatabase(nil)
 	require.NoError(t, err)
-	manager, err := NewSnapshotManager(cfg, nil, tokens, snapshotRankAdapter{})
+	manager, err := NewSnapshotManager(cfg, snapshotTestIndex(t, nil), tokens, snapshotRankAdapter{})
 	require.NoError(t, err)
 
 	require.NoError(t, manager.EnsureSubscriber(ctx, "pod-rank-3", "pod:8003", "tcp://127.0.0.1:5560", "", "kv@", true))
@@ -129,4 +129,13 @@ func TestSnapshotSubscriberOffsetsPortByLiveRank(t *testing.T) {
 
 	cancel()
 	manager.Shutdown(context.Background())
+}
+
+func snapshotTestIndex(t *testing.T, indexCfg *kvblock.IndexConfig) kvblock.Index {
+	t.Helper()
+	indexCfg, err := SnapshotIndexConfig(indexCfg)
+	require.NoError(t, err)
+	index, err := kvblock.NewIndex(context.Background(), indexCfg)
+	require.NoError(t, err)
+	return index
 }

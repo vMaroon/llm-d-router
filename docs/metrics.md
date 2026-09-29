@@ -392,6 +392,11 @@ per-endpoint gauges are updated as requests are admitted and released.
 Prefix `llm_d_epp_`. Registered only when the embedded llm-d-kv-cache metrics are enabled (see
 [Embedded llm-d-kv-cache metrics](#embedded-llm-d-kv-cache-metrics)). Unlabeled.
 
+With snapshot recovery (`kvEventsConfig.snapshotPort`), the snapshot manager writes every KV event
+into this index and serves every scored lookup that has at least one routable publisher from it.
+Admissions and evictions there include whole-generation writes at snapshot bootstrap and
+whole-generation removals when a publisher's generation ends.
+
 | Name | Type | Notes |
 |---|---|---|
 | `kv_cache_index_admissions_total` | Counter | Blocks admitted to the index. |
