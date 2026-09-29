@@ -34,6 +34,7 @@ import (
 	attrprefix "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/prefix"
 	approxprefixconstants "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/approximateprefix/constants"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/prefixhash"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/prefixmetrics"
 	tokenproducer "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/tokenizer"
 )
 
@@ -155,6 +156,7 @@ func newDataProducer(ctx context.Context, name string, config config, handle plu
 	if err := registerMetrics(handle.Metrics()); err != nil {
 		return nil, err
 	}
+	prefixmetrics.Register()
 	// Surface the override to the operator so a too-small configured value is
 	// not silently swallowed. The clamp itself happens at request time in
 	// GetBlockSize and applies uniformly across endpoint metric, autotune
@@ -227,13 +229,15 @@ func (p *dataProducer) PluginState() *plugin.PluginState {
 // Produce is called by the director before scheduling requests.
 func (p *dataProducer) Produce(ctx context.Context, request *fwksched.InferenceRequest, pods []fwksched.Endpoint) error {
 	blockSize := p.GetBlockSize(pods)
-	perPromptHashes := prefixhash.GetBlockHashes(ctx, request, blockSize, p.resolveMaxBlocks(blockSize))
+	perPromptHashes, perPromptTokens := prefixhash.GetBlockHashesWithPromptTokens(ctx, request, blockSize, p.resolveMaxBlocks(blockSize))
 
 	prefixCacheServers := make(map[ServerID]int)
+	predictedCachedTokens := make(map[ServerID]int)
 	totalBlocks := 0
-	for _, hashes := range perPromptHashes {
+	for i, hashes := range perPromptHashes {
 		for server, matchLen := range p.matchLongestPrefix(ctx, hashes) {
 			prefixCacheServers[server] += matchLen
+			predictedCachedTokens[server] += min(matchLen*blockSize, perPromptTokens[i])
 		}
 		totalBlocks += len(hashes)
 	}
@@ -244,8 +248,9 @@ func (p *dataProducer) Produce(ctx context.Context, request *fwksched.InferenceR
 	}
 
 	state := &SchedulingContextState{
-		PerPromptHashes:    perPromptHashes,
-		PrefixCacheServers: prefixCacheServers,
+		PerPromptHashes:       perPromptHashes,
+		PrefixCacheServers:    prefixCacheServers,
+		PredictedCachedTokens: predictedCachedTokens,
 	}
 
 	p.pluginState.Write(request.RequestID, plugin.StateKey(p.typedName.Name), state)
@@ -265,10 +270,15 @@ func (p *dataProducer) PreRequest(ctx context.Context, request *fwksched.Inferen
 
 	targetEndpoint := primaryProfileResult.TargetEndpoints[0]
 	servers := []server{p.makeserver(targetEndpoint)}
+	// The prefix-hit prediction follows the endpoint that computes the prompt:
+	// the prefill target in P/D disaggregated mode, where the primary profile
+	// is decode, and the primary target otherwise.
+	predictedEndpoint := targetEndpoint
 
 	// Also record for prefill node if present in P/D disaggregated mode.
 	if pr, exists := schedulingResult.ProfileResults[experimentalDefaultPrefillProfile]; exists && len(pr.TargetEndpoints) > 0 {
 		servers = append(servers, p.makeserver(pr.TargetEndpoints[0]))
+		predictedEndpoint = pr.TargetEndpoints[0]
 	}
 
 	// Read state saved during Produce.
@@ -296,6 +306,11 @@ func (p *dataProducer) PreRequest(ctx context.Context, request *fwksched.Inferen
 	blockSize := p.GetBlockSize(primaryProfileResult.TargetEndpoints)
 	const averageCharactersPerToken = 4
 	recordPrefixCacheMatch(p.typedName.Name, p.typedName.Type, matchLen*blockSize*averageCharactersPerToken, total*blockSize*averageCharactersPerToken)
+	if request.Body != nil {
+		prefixmetrics.RecordPrediction(p.typedName.Name, p.typedName.Type,
+			state.PredictedCachedTokens[ServerID(predictedEndpoint.GetMetadata().ID)],
+			request.Body.TokenizedPrompt.TokenCount())
+	}
 	return nil
 }
 

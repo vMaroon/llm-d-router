@@ -31,6 +31,8 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
 	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
+	attrprefix "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/prefix"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/prefixmetrics"
 )
 
 const (
@@ -74,6 +76,41 @@ func (s *blockKeysState) Clone() plugin.StateData {
 		matches[endpoint] = match
 	}
 	return &blockKeysState{perPromptKeys: cp, repairMatches: matches}
+}
+
+// recordPrediction reports the prompt tokens the index expects the endpoint
+// that computes the prompt to serve from its prefix cache. That endpoint is the
+// first target of the prefill profile when the scheduling result carries one,
+// and the primary profile's first target otherwise. Under P/D disaggregation
+// the primary profile is decode, while only prefill endpoints publish KV events
+// and hold the prompt's blocks. It reads the unweighted cached-block count
+// rather than the tier-weighted match score, so a RAM-tier hit contributes its
+// full token count, and it counts speculative entries because those are part
+// of what the router acted on. The token processor drops a prompt's trailing
+// partial block, so the block-to-token conversion cannot exceed the prompt
+// length. An endpoint without this producer's match info is not observed.
+func (p *Producer) recordPrediction(request *scheduling.InferenceRequest, schedulingResult *scheduling.SchedulingResult) {
+	if request == nil || request.Body == nil || request.Body.TokenizedPrompt == nil ||
+		schedulingResult == nil || schedulingResult.ProfileResults == nil {
+		return
+	}
+	selected := schedulingResult.ProfileResults[schedulingResult.PrimaryProfileName]
+	if prefill := schedulingResult.ProfileResults[experimentalPrefillProfile]; prefill != nil && len(prefill.TargetEndpoints) > 0 {
+		selected = prefill
+	}
+	if selected == nil || len(selected.TargetEndpoints) == 0 {
+		return
+	}
+	raw, ok := selected.TargetEndpoints[0].Get(p.dk)
+	if !ok {
+		return
+	}
+	info, ok := raw.(*attrprefix.PrefixCacheMatchInfo)
+	if !ok {
+		return
+	}
+	prefixmetrics.RecordPrediction(p.typedName.Name, p.typedName.Type,
+		info.CachedBlockCount()*info.BlockSizeTokens(), request.Body.TokenizedPrompt.TokenCount())
 }
 
 // buildSpeculativeCache constructs the TTL cache used to evict speculative
@@ -123,12 +160,15 @@ func buildSpeculativeCache(ctx context.Context, config PluginConfig,
 	return cache, ttl, nil
 }
 
-// PreRequest may request a bounded full KV-cache report for an eligible,
-// materially under-indexed selected endpoint, then seeds speculative entries
-// when speculative indexing is enabled.
+// PreRequest records the prefix-cache hit predicted for the selected endpoint
+// on every scheduled request, then may request a bounded full KV-cache report
+// for an eligible, materially under-indexed selected endpoint, and seeds
+// speculative entries when speculative indexing is enabled.
 func (p *Producer) PreRequest(ctx context.Context,
 	request *scheduling.InferenceRequest, schedulingResult *scheduling.SchedulingResult,
 ) error {
+	p.recordPrediction(request, schedulingResult)
+
 	if !p.speculativeEnabled && p.fullReportRepair == nil {
 		return nil
 	}

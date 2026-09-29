@@ -143,6 +143,23 @@ Labels `{plugin_name, plugin_type}`.
 | `prefix_indexer_hit_ratio` | Histogram | Prefix-match hit ratio. |
 | `prefix_indexer_hit_bytes` | Histogram | Bytes matched per lookup. |
 
+### Prefix cache prediction
+
+Emitted by the `approx-prefix-cache-producer` and the `precise-prefix-cache-producer` on every
+scheduled request. Labels `{plugin_name, plugin_type}`.
+
+| Name | Type | Notes |
+|---|---|---|
+| `prefix_predicted_cached_tokens` | Histogram | Prompt tokens predicted to hit the prefix cache of the endpoint that computes the prompt. |
+| `prefix_prompt_tokens` | Histogram | Prompt tokens the prediction was measured against. |
+
+The predicted hit rate is `prefix_predicted_cached_tokens_sum / prefix_prompt_tokens_sum`; both
+are observed in one call, over the same requests. The endpoint is the first target of the `prefill`
+profile when the scheduling result has one (P/D disaggregation, where the primary profile is
+decode), and the primary profile's first target otherwise. The model server's delivered rate,
+`request_cached_tokens_sum / request_input_tokens_sum`, is recorded from responses only, so it
+omits requests that fail or return no usage.
+
 ### Multimodal encoder cache
 
 | Name | Type | Notes |

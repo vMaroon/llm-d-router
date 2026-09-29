@@ -58,31 +58,43 @@ func (b HashBlock) Hash() uint64 {
 // For subsequent blocks, the hash is calculated as: hash(block i content, hash(i-1)).
 // It requires request.Body.TokenizedPrompt to be populated by a token-producer backend.
 func GetBlockHashes(ctx context.Context, request *scheduling.InferenceRequest, blockSizeTokens int, maxPrefixBlocks int) [][]BlockHash {
+	hashes, _ := GetBlockHashesWithPromptTokens(ctx, request, blockSizeTokens, maxPrefixBlocks)
+	return hashes
+}
+
+// GetBlockHashesWithPromptTokens hashes as GetBlockHashes does and additionally
+// returns the token count of the prompt behind each entry, positionally aligned
+// with the hashes. A prompt's final block may be partial, so converting a
+// matched block count back to tokens overshoots unless it is bounded by the
+// length of the prompt that produced the blocks.
+func GetBlockHashesWithPromptTokens(ctx context.Context, request *scheduling.InferenceRequest, blockSizeTokens int, maxPrefixBlocks int) ([][]BlockHash, []int) {
 	loggerDebug := log.FromContext(ctx).V(logutil.DEBUG)
 	if request == nil || request.Body == nil {
 		loggerDebug.Info("Request or request data is nil, skipping hashing")
-		return nil
+		return nil, nil
 	}
 
 	tp := request.Body.TokenizedPrompt
 	if tp == nil || tp.TokenCount() == 0 {
 		loggerDebug.Info("TokenizedPrompt is empty, skipping hashing")
-		return nil
+		return nil, nil
 	}
 
 	var result [][]BlockHash
+	var promptTokens []int
 	for _, tokens := range tp.PerPromptTokens {
 		seq := getKVCacheBlocksFromTokens(tokens, blockSizeTokens)
 		hashes := computeBlockHashes(seq, request, maxPrefixBlocks)
 		if len(hashes) > 0 {
 			result = append(result, hashes)
+			promptTokens = append(promptTokens, len(tokens))
 		}
 	}
 	if len(result) == 0 {
 		loggerDebug.Info("No kv cache block found")
-		return nil
+		return nil, nil
 	}
-	return result
+	return result, promptTokens
 }
 
 // computeBlockHashes calculates the hash for content blocks.
