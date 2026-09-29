@@ -61,7 +61,9 @@ func (p *Producer) Extract(ctx context.Context, event fwkdl.EndpointEvent) error
 		logger.V(logging.DEBUG).Info("Adding subscriber", "endpoint", endpointKey)
 	case fwkdl.EventDelete:
 		p.subscribersManager.RemoveSubscriber(ctx, endpointKey)
-		if meta.Address != "" {
+		// Snapshot entries are keyed by publisher generation, and a removed
+		// subscriber clears its own generation, so an address match finds nothing.
+		if meta.Address != "" && p.snapshots == nil {
 			if err := p.kvCacheIndexer.KVBlockIndex().Clear(ctx, fmt.Sprintf("%s:%s", meta.Address, meta.Port)); err != nil {
 				logger.Error(err, "Failed to clear index entries for removed endpoint",
 					"endpoint", endpointKey, "address", meta.Address, "port", meta.Port)

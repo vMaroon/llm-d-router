@@ -22,6 +22,7 @@ import (
 	"testing"
 
 	"github.com/go-logr/logr"
+	"github.com/llm-d/llm-d-router/pkg/kvcache/kvblock"
 	"github.com/llm-d/llm-d-router/pkg/kvevents"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -315,6 +316,44 @@ func TestProducer_ExtractEndpoint_DeleteClearsIndex(t *testing.T) {
 
 	ids, _ := p.subscribersManager.GetActiveSubscribers()
 	assert.Empty(t, ids)
+}
+
+// With snapshot recovery, EventDelete leaves the index to the removed
+// subscriber, whose generation cleanup owns the endpoint's entries.
+func TestProducer_ExtractEndpoint_DeleteSkipsAddressClearWithSnapshots(t *testing.T) {
+	ctx := discardCtx(t)
+
+	cleared := 0
+	fakeIndex := &fakeKVBlockIndex{
+		clearFn: func(context.Context, string) error {
+			cleared++
+			return nil
+		},
+	}
+	cfg := kvevents.DefaultConfig()
+	cfg.DiscoverPods = true
+	cfg.PodDiscoveryConfig = kvevents.DefaultPodReconcilerConfig()
+	cfg.PodDiscoveryConfig.SocketPort = 5557
+	cfg.SnapshotPort = 6557
+	tokens, err := kvblock.NewChunkedTokenDatabase(nil)
+	require.NoError(t, err)
+	indexCfg, err := kvevents.SnapshotIndexConfig(nil)
+	require.NoError(t, err)
+	index, err := kvblock.NewIndex(ctx, indexCfg)
+	require.NoError(t, err)
+	snapshots, err := kvevents.NewSnapshotManager(cfg, index, tokens, nil)
+	require.NoError(t, err)
+	p := &Producer{
+		typedName:          plugin.TypedName{Type: PluginType, Name: PluginType},
+		subscribersManager: snapshots,
+		snapshots:          snapshots,
+		kvEventsConfig:     cfg,
+		kvCacheIndexer:     &fakeKVCacheIndexer{index: fakeIndex},
+		subscriberCtx:      context.Background(),
+	}
+
+	require.NoError(t, p.Extract(ctx, fwkdl.EndpointEvent{Type: fwkdl.EventDelete, Endpoint: newEndpoint("pod-gone", "10.0.0.98")}))
+	assert.Zero(t, cleared, "snapshot mode must not scan the index for an address identity")
 }
 
 // Delete by NamespacedName must work even when the event has no address.
