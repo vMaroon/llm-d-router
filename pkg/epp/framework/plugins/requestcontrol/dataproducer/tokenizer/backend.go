@@ -107,6 +107,12 @@ type renderBackend struct {
 	mergeAnthropicInlineSystem bool
 }
 
+// responsesRenderer renders OpenAI Responses payloads. Only the vLLM backend
+// implements it; other backends leave Responses requests untokenized.
+type responsesRenderer interface {
+	RenderResponses(ctx context.Context, payload fwkrh.RequestPayload) ([]uint32, *tokenization.MultiModalFeatures, error)
+}
+
 // typedChatRenderer accepts the already-converted render request. The vLLM
 // backend implements this to avoid converting large Anthropic requests through
 // JSON into a generic map only to marshal that map again for HTTP.
@@ -140,6 +146,19 @@ func (b renderBackend) produce(ctx context.Context, body *fwkrh.InferenceRequest
 		} else {
 			tokenIDs, mmFeatures, err = b.tk.RenderChat(ctx, messagesPayload(body))
 		}
+		if err != nil {
+			return nil, fmt.Errorf("tokenization failed: %w", err)
+		}
+		return &fwkrh.TokenizedPrompt{
+			PerPromptTokens:    [][]uint32{tokenIDs},
+			MultiModalFeatures: convertMMFeaturesToUpstream(mmFeatures),
+		}, nil
+	case body.Responses != nil:
+		renderer, ok := b.tk.(responsesRenderer)
+		if !ok {
+			return nil, errors.New("unsupported request body type, skipping tokenization")
+		}
+		tokenIDs, mmFeatures, err := renderer.RenderResponses(ctx, body.Payload)
 		if err != nil {
 			return nil, fmt.Errorf("tokenization failed: %w", err)
 		}

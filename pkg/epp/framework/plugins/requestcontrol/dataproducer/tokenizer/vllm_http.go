@@ -49,6 +49,7 @@ const (
 	completionsRenderPath = "/v1/completions/render"
 	chatRenderPath        = "/v1/chat/completions/render"
 	messagesRenderPath    = "/v1/messages/render"
+	responsesRenderPath   = "/v1/responses/render"
 
 	// maxErrorBodySnippetBytes truncates non-2xx response bodies before
 	// embedding them in the returned error, so a misconfigured upstream that
@@ -368,6 +369,59 @@ func (r *vllmHTTPRenderer) RenderMessages(ctx context.Context, payload fwkrh.Req
 		return nil, nil, errors.New("vLLM render returned no token IDs")
 	}
 	return resp.TokenIDs, toKVCacheMM(resp.Features), nil
+}
+
+// RenderResponses passes the forwarded OpenAI Responses payload to vLLM, which
+// renders input, instructions and tools the way it serves the request. A request
+// that continues a stored response (previous_response_id) renders only on the
+// engine holding that response, so it is not rendered here.
+func (r *vllmHTTPRenderer) RenderResponses(ctx context.Context, payload fwkrh.RequestPayload) ([]uint32, *tokenization.MultiModalFeatures, error) {
+	if payload == nil {
+		return nil, nil, errors.New("responses rendering requires a parsed PayloadMap")
+	}
+	pm, ok := payload.AsMap()
+	if !ok {
+		return nil, nil, errors.New("responses rendering requires a parsed PayloadMap")
+	}
+	if id, _ := pm["previous_response_id"].(string); id != "" {
+		return nil, nil, errors.New("responses request continues a stored response, skipping tokenization")
+	}
+	body := maps.Clone(pm)
+	body["model"] = r.modelName
+	timeout := r.timeout
+	if items, ok := pm["input"].([]any); ok {
+		for _, item := range items {
+			if m, ok := item.(map[string]any); ok {
+				if parts, ok := m["content"].([]any); ok && hasNonTextPart(parts) {
+					timeout = r.mmTimeout
+					break
+				}
+			}
+		}
+	}
+	var resp renderResponse
+	if err := r.postJSON(ctx, responsesRenderPath, body, timeout, &resp); err != nil {
+		return nil, nil, err
+	}
+	if len(resp.TokenIDs) == 0 {
+		return nil, nil, errors.New("vLLM render returned no token IDs")
+	}
+	return resp.TokenIDs, toKVCacheMM(resp.Features), nil
+}
+
+// hasNonTextPart reports whether Responses content parts include anything other
+// than text, which may need the longer multimodal render timeout.
+func hasNonTextPart(parts []any) bool {
+	for _, part := range parts {
+		p, ok := part.(map[string]any)
+		if !ok {
+			return true
+		}
+		if t, _ := p["type"].(string); t != "input_text" && t != "output_text" && t != "text" {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *vllmHTTPRenderer) chatTimeout(payload fwkrh.PayloadMap) time.Duration {
