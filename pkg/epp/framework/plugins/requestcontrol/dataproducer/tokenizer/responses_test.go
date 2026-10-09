@@ -352,16 +352,16 @@ func TestResponsesRenderMode(t *testing.T) {
 				require.NoError(t, readErr)
 				if auto && calls == 1 {
 					require.Equal(t, responsesRenderPath, r.URL.Path)
-					require.JSONEq(t, `{"model":"configured-model","max_output_tokens":1,"input":"warmup"}`, string(body))
+					require.JSONEq(t, defaultRenderCopy(t, `{"model":"configured-model","max_output_tokens":1,"input":"warmup"}`), string(body))
 					_, _ = io.WriteString(w, `{"token_ids":[1]}`)
 					return
 				}
 				if tc.legacy {
 					require.Equal(t, chatRenderPath, r.URL.Path)
-					require.JSONEq(t, `{"model":"configured-model","messages":[{"role":"user","content":"hi"}]}`, string(body))
+					require.JSONEq(t, defaultRenderCopy(t, `{"model":"configured-model","messages":[{"role":"user","content":"hi"}]}`), string(body))
 				} else {
 					require.Equal(t, responsesRenderPath, r.URL.Path)
-					require.JSONEq(t, raw, string(body))
+					require.JSONEq(t, defaultRenderCopy(t, raw), string(body))
 				}
 				_, _ = io.WriteString(w, `{"token_ids":[1,2,3],"features":{"mm_hashes":{"image":["hash"]},"mm_placeholders":{"image":[{"offset":1,"length":2}]}}}`)
 			}))

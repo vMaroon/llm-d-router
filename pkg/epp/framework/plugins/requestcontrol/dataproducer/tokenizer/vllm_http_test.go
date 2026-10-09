@@ -106,7 +106,7 @@ func TestVLLMHTTPRenderer_TimeoutBudgets(t *testing.T) {
 					}
 					body, err := io.ReadAll(request.Body)
 					require.NoError(t, err)
-					require.Equal(t, req.raw, string(body))
+					require.Equal(t, defaultRenderCopy(t, req.raw), string(body))
 					response := `{"token_ids":[1]}`
 					if req.path == completionsRenderPath {
 						response = "[" + response + "]"

@@ -95,7 +95,7 @@ func TestNativeRenderPreservesRequest(t *testing.T) {
 			req := &scheduling.InferenceRequest{Body: parsed.Body, TargetModel: "adapter", Headers: map[string]string{"authorization": "Bearer native-render"}}
 			require.NoError(t, p.Produce(context.Background(), req, nil))
 			require.Equal(t, tt.path+"/render", path)
-			require.Equal(t, tt.body, string(got))
+			require.Equal(t, defaultRenderCopy(t, tt.body), string(got))
 			require.Equal(t, [][]uint32{{3, 4}}, [][]uint32{req.Body.TokenizedRequest.Prompts[0].TokenIDs})
 
 			unrewritten, err := tt.parser.ParseRequest(context.Background(), []byte(tt.body), map[string]string{":path": tt.path})
@@ -124,7 +124,7 @@ func TestNativeRenderPreservesRequest(t *testing.T) {
 			})
 			forwarded, err := parsed.Body.WirePayload().(fwkrh.Marshaler).Marshal()
 			require.NoError(t, err)
-			assertNativeFieldsUnchanged(t, got, forwarded)
+			assertNativeFieldsUnchanged(t, got, forwarded, "return_mm_kwargs")
 		})
 	}
 }

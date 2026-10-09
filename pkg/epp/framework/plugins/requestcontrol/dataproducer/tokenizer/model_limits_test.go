@@ -29,6 +29,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"k8s.io/utils/ptr"
 
 	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
@@ -329,6 +330,40 @@ func TestOmitMMKwargs(t *testing.T) {
 	}
 }
 
+// defaultRenderCopy is the body the renderer sends for raw when omitMMKwargs is unset.
+func defaultRenderCopy(t require.TestingT, raw string) string {
+	out, err := omitMMKwargs([]byte(raw))
+	require.NoError(t, err)
+	return string(out)
+}
+
+func TestOmitMMKwargsDefault(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		option *bool
+		want   string
+	}{
+		{"unset", nil, "false"},
+		{"true", ptr.To(true), "false"},
+		{"false", ptr.To(false), ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var seen map[string]json.RawMessage
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				assert.NoError(t, json.NewDecoder(r.Body).Decode(&seen))
+				_, _ = w.Write([]byte(`{"token_ids":[1,2,3]}`))
+			}))
+			defer server.Close()
+			renderer, err := newVLLMHTTPRenderer(&vllmConfig{URL: server.URL, OmitMMKwargs: tc.option})
+			require.NoError(t, err)
+			raw := fwkrh.RawPayload(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`)
+			_, _, err = renderer.RenderChat(context.Background(), raw)
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, string(seen["return_mm_kwargs"]))
+		})
+	}
+}
+
 func TestOmitMMKwargsAppliesToRawPayload(t *testing.T) {
 	var seen map[string]json.RawMessage
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -336,7 +371,7 @@ func TestOmitMMKwargsAppliesToRawPayload(t *testing.T) {
 		_, _ = w.Write([]byte(`{"token_ids":[1,2,3]}`))
 	}))
 	defer server.Close()
-	renderer, err := newVLLMHTTPRenderer(&vllmConfig{URL: server.URL, PrefillOnly: true, OmitMMKwargs: true})
+	renderer, err := newVLLMHTTPRenderer(&vllmConfig{URL: server.URL, PrefillOnly: true})
 	require.NoError(t, err)
 	raw := fwkrh.RawPayload(`{"model":"adapter","messages":[{"role":"user","content":"hi"}],"max_tokens":32000}`)
 	_, _, err = renderer.RenderChat(context.Background(), raw)

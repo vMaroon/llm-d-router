@@ -83,16 +83,16 @@ func TestMessagesRenderMode(t *testing.T) {
 				require.Equal(t, "Bearer secret", r.Header.Get("Authorization"))
 				if auto && calls == 1 {
 					require.Equal(t, messagesRenderPath, r.URL.Path)
-					require.JSONEq(t, `{"model":"configured-model","max_tokens":1,"messages":[{"role":"user","content":"warmup"}]}`, string(body))
+					require.JSONEq(t, defaultRenderCopy(t, `{"model":"configured-model","max_tokens":1,"messages":[{"role":"user","content":"warmup"}]}`), string(body))
 					_, _ = io.WriteString(w, `{"token_ids":[1]}`)
 					return
 				}
 				if tc.legacy {
 					require.Equal(t, chatRenderPath, r.URL.Path)
-					require.JSONEq(t, `{"model":"configured-model","messages":[{"role":"user","content":"hi"}]}`, string(body))
+					require.JSONEq(t, defaultRenderCopy(t, `{"model":"configured-model","messages":[{"role":"user","content":"hi"}]}`), string(body))
 				} else {
 					require.Equal(t, messagesRenderPath, r.URL.Path)
-					require.Equal(t, raw, string(body))
+					require.Equal(t, defaultRenderCopy(t, raw), string(body))
 				}
 				_, _ = io.WriteString(w, `{"token_ids":[1,2,3],"features":{"mm_hashes":{"image":["hash"]},"mm_placeholders":{"image":[{"offset":1,"length":2}]}}}`)
 			}))
@@ -282,7 +282,7 @@ func TestMessagesRenderModeLeavesOtherProtocolsUnchanged(t *testing.T) {
 					require.Equal(t, tc.renderPath, r.URL.Path)
 					raw, err := io.ReadAll(r.Body)
 					require.NoError(t, err)
-					require.Equal(t, tc.raw, string(raw))
+					require.Equal(t, defaultRenderCopy(t, tc.raw), string(raw))
 					if r.URL.Path == completionsRenderPath {
 						_, _ = io.WriteString(w, `[{"token_ids":[1,2,3]}]`)
 					} else {
@@ -395,7 +395,7 @@ func TestAutoMessagesRendering(t *testing.T) {
 					status, response := tc.userStatus, `{"token_ids":[1,2,3]}`
 					if payload.Messages[0].Content == "warmup" {
 						calls = append(calls, "probe "+r.URL.Path)
-						require.JSONEq(t, `{"model":"configured-model","max_tokens":1,"messages":[{"role":"user","content":"warmup"}]}`, string(body))
+						require.JSONEq(t, defaultRenderCopy(t, `{"model":"configured-model","max_tokens":1,"messages":[{"role":"user","content":"warmup"}]}`), string(body))
 						status = tc.nativeStatus
 						if r.URL.Path == chatRenderPath {
 							status = tc.chatStatus
@@ -415,7 +415,7 @@ func TestAutoMessagesRendering(t *testing.T) {
 							require.Equal(t, "configured-model", payload.Model)
 						} else {
 							require.Equal(t, messagesRenderPath, r.URL.Path)
-							require.Equal(t, raw, string(body))
+							require.Equal(t, defaultRenderCopy(t, raw), string(body))
 						}
 					}
 					if status != 0 {

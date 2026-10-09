@@ -37,6 +37,7 @@ import (
 
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"golang.org/x/time/rate"
+	"k8s.io/utils/ptr"
 
 	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
 )
@@ -121,7 +122,8 @@ type vllmConfig struct {
 	// PrefillOnly reserves one output token on the render copy, without changing inference.
 	PrefillOnly bool `json:"prefillOnly,omitempty"`
 	// OmitMMKwargs asks vLLM to leave processed multimodal tensors out of render responses.
-	OmitMMKwargs bool `json:"omitMMKwargs,omitempty"`
+	// Defaults to true if unset.
+	OmitMMKwargs *bool `json:"omitMMKwargs,omitempty"`
 	// EndpointDiscovery sends render requests directly to endpoints published
 	// by the configured data-layer discovery provider. Mutually exclusive with URL.
 	EndpointDiscovery *endpointDiscoveryConfig `json:"endpointDiscovery,omitempty"`
@@ -213,7 +215,7 @@ func newVLLMHTTPRenderer(cfg *vllmConfig) (*vllmHTTPRenderer, error) {
 		mmTimeout:      mmTimeout,
 		attemptTimeout: attemptTimeout,
 		prefillOnly:    cfg.PrefillOnly,
-		omitMMKwargs:   cfg.OmitMMKwargs,
+		omitMMKwargs:   ptr.Deref(cfg.OmitMMKwargs, defaultOmitMMKwargs),
 		failureLog:     rate.Sometimes{Interval: renderFailureLogInterval},
 	}, nil
 }
@@ -430,6 +432,9 @@ func renderOnlyBudget(payload []byte) ([]byte, error) {
 	}
 	return json.Marshal(envelope)
 }
+
+// defaultOmitMMKwargs is used when OmitMMKwargs is unset.
+const defaultOmitMMKwargs = true
 
 var omitMMKwargsField = []byte(`"return_mm_kwargs":false`)
 
