@@ -143,26 +143,28 @@ func (f *eventDedupFilter) trackStore(scope blockScope, blockHashes []uint64) {
 // returns only the hashes that should actually be evicted from the index: a
 // hash is forwarded when its count reaches zero, or when it was never tracked
 // (defensive pass-through). The returned slice preserves the input order and
-// multiplicity.
-func (f *eventDedupFilter) filterRemove(scope blockScope, blockHashes []uint64) []uint64 {
+// multiplicity. The second result holds the never-tracked hashes among them.
+func (f *eventDedupFilter) filterRemove(scope blockScope, blockHashes []uint64) (kept, untracked []uint64) {
 	if f == nil || len(blockHashes) == 0 {
-		return blockHashes
+		return blockHashes, blockHashes
 	}
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
 	bucket := f.refs[scope.podIdentifier]
-	kept := make([]uint64, 0, len(blockHashes))
+	kept = make([]uint64, 0, len(blockHashes))
 	for _, h := range blockHashes {
 		if bucket == nil {
 			kept = append(kept, h) // unknown pod -> defensive pass-through
+			untracked = append(untracked, h)
 			continue
 		}
 		k := scope.key(h)
 		count, ok := bucket[k]
 		if !ok || count <= 0 {
 			kept = append(kept, h) // never tracked -> defensive pass-through
+			untracked = append(untracked, h)
 			continue
 		}
 		count--
@@ -176,7 +178,7 @@ func (f *eventDedupFilter) filterRemove(scope blockScope, blockHashes []uint64) 
 	if bucket != nil && len(bucket) == 0 {
 		delete(f.refs, scope.podIdentifier)
 	}
-	return kept
+	return kept, untracked
 }
 
 // clear drops all reference counts for a pod. It is invoked on
